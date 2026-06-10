@@ -5,7 +5,7 @@ import { Like, Repository, In, EntityManager } from 'typeorm'
 import { instanceToPlain, plainToInstance } from 'class-transformer'
 import { genSalt, hash, compare, genSaltSync, hashSync } from 'bcryptjs'
 import { JwtService } from '@nestjs/jwt'
-import xlsx from 'node-xlsx'
+import ExcelJS from 'exceljs'
 import ms from 'ms'
 
 import { ResultData } from '../../common/utils/result'
@@ -129,16 +129,16 @@ export class UserService {
       return ResultData.fail(AppHttpCode.FILE_TYPE_ERROR, '文件类型错误，请上传 .xls 或 .xlsx 文件')
     if (file.size > 5 * 1024 * 1024)
       return ResultData.fail(AppHttpCode.FILE_SIZE_EXCEED_LIMIT, '文件大小超过，最大支持 5M')
-    const workSheet = xlsx.parse(file.buffer)
+    const data = await this.parseExcel(file.buffer)
     // 需要处理 excel 内帐号 手机号 邮箱 是否有重复的情况
-    if (workSheet[0].data.length === 0) return ResultData.fail(AppHttpCode.DATA_IS_EMPTY, 'excel 导入数据为空')
+    if (data.length === 0) return ResultData.fail(AppHttpCode.DATA_IS_EMPTY, 'excel 导入数据为空')
     const userArr = []
     const accountMap = new Map()
     const phoneMap = new Map()
     const emailMap = new Map()
-    // 从 1 开始是去掉 excel 帐号等文字提示
-    for (let i = 1, len = workSheet[0].data.length; i < len; i++) {
-      const dataArr = workSheet[0].data[i] as Array<any>
+    // 从 0 开始(data 已去掉表头)
+    for (let i = 0, len = data.length; i < len; i++) {
+      const dataArr = data[i] as Array<any>
       if (dataArr.length === 0) break
       const [account, phone, email, avatar] = dataArr
       userArr.push({ account, phoneNum: phone, email, avatar })
@@ -239,6 +239,30 @@ export class UserService {
       )
     })
     return ResultData.ok(instanceToPlain(result))
+  }
+
+  /**
+   * 解析 excel 第一个工作表,返回与原 node-xlsx workSheet[0].data 等价的二维数组(已跳过表头)
+   */
+  private async parseExcel(buffer: Buffer): Promise<any[][]> {
+    const workbook = new ExcelJS.Workbook()
+    // Node 20 Buffer 是 Buffer<ArrayBufferLike> 泛型,exceljs 类型签名较老,用 ArrayBuffer 兼容
+    await workbook.xlsx.load(buffer as unknown as ArrayBuffer)
+    const worksheet = workbook.worksheets[0]
+    if (!worksheet) return []
+    const data: any[][] = []
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      // 跳过表头
+      if (rowNumber === 1) return
+      const rowData: any[] = []
+      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+        // cell.value 可能是富文本对象 { richText: [...] }、超链接 { hyperlink, text } 或直接值
+        const v = cell.value
+        rowData[colNumber - 1] = v && typeof v === 'object' && 'text' in v ? (v as any).text : v
+      })
+      data.push(rowData)
+    })
+    return data
   }
 
   /** 更新用户信息 */

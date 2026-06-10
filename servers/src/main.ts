@@ -26,11 +26,16 @@ async function bootstrap() {
     cors: true,
   })
 
+  // 反向代理场景下需要显式声明 trust proxy,express-rate-limit/request-ip/rate-limit 等中间件依赖 req.ip
+  // 详见 https://expressjs.com/en/guide/behind-proxies.html
+  app.getHttpAdapter().getInstance().set('trust proxy', 'loopback')
+
   // 设置访问频率
   app.use(
     rateLimit({
       windowMs: 15 * 60 * 1000, // 15分钟
-      max: 1000, // 限制15分钟内最多只能访问1000次
+      limit: 1000, // 限制15分钟内最多只能访问1000次(express-rate-limit 7+ 字段名变更)
+      standardHeaders: 'draft-7', // RFC 草案 7 的 RateLimit 头
     }),
   )
 

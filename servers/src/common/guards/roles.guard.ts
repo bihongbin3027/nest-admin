@@ -1,7 +1,7 @@
 import { CanActivate, Inject, ExecutionContext, Injectable, ForbiddenException } from '@nestjs/common'
 import { Reflector } from '@nestjs/core'
 import { ConfigService } from '@nestjs/config'
-import { pathToRegexp } from 'path-to-regexp'
+import { match } from 'path-to-regexp'
 
 import { ALLOW_ANON } from '../decorators/allow-anon.decorator'
 import { ALLOW_NO_PERM } from '../decorators/perm.decorator'
@@ -31,8 +31,9 @@ export class RolesGuard implements CanActivate {
     const i = this.globalWhiteList.findIndex((route) => {
       // 请求方法类型相同
       if (req.method.toUpperCase() === route.method.toUpperCase()) {
-        // 对比 url
-        return !!pathToRegexp(route.path).exec(req.url)
+        // path-to-regexp v8:match(path)(url) 返回 false 或 { path, params, index }
+        const fn = match(route.path, { decode: decodeURIComponent })
+        return !!fn(req.url)
       }
       return false
     })
@@ -55,7 +56,9 @@ export class RolesGuard implements CanActivate {
       if (req.method.toUpperCase() === route.method.toUpperCase()) {
         // 对比 url
         const reqUrl = req.url.split('?')[0]
-        return !!pathToRegexp(route.path).exec(reqUrl)
+        // path-to-regexp v8
+        const fn = match(route.path, { decode: decodeURIComponent })
+        return !!fn(reqUrl)
       }
       return false
     })

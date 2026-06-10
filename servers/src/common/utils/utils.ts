@@ -41,7 +41,7 @@ export function objAttrToCamelOrUnderline(
   const _target = {}
   Object.keys(target).forEach((k) => {
     let _k = k
-    if (!!cutStr) {
+    if (cutStr) {
       _k = _k.replace(cutStr, '')
     }
     _k = targetType === 'camelCase' ? toCamelCase(_k) : toUnderline(_k)

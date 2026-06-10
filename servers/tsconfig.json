@@ -13,7 +13,9 @@
     "outDir": "./dist",
     "rootDir": "./src",
     // "types": ["node"],
-    "incremental": true,
+    // 关闭 incremental：@nestjs/cli@11 的 WatchCompiler 使用 tsc 的 createWatchProgram，
+    // incremental 命中缓存时只打印 "0 errors" 不 emit，随后 spawnChildProcess 找不到 dist/main。
+    "incremental": false,
     "skipLibCheck": true,
     "strictNullChecks": false,
     "noImplicitAny": false,

@@ -1,12 +1,12 @@
 import { Module } from '@nestjs/common'
 import { ConfigModule, ConfigService } from '@nestjs/config'
 import { TypeOrmModule, TypeOrmModuleOptions } from '@nestjs/typeorm'
-import { RedisClientOptions } from '@liaoliaots/nestjs-redis'
 import { ServeStaticModule, ServeStaticModuleOptions } from '@nestjs/serve-static'
 import { APP_GUARD } from '@nestjs/core'
 import path from 'path'
 
 import configuration from './config/index'
+import { RedisOptions } from 'ioredis'
 
 import { RedisModule } from './common/libs/redis/redis.module'
 import { JwtAuthGuard } from './common/guards/auth.guard'
@@ -61,7 +61,6 @@ import { PostModule } from './system/post/post.module'
           //
           // entities: [`${__dirname}/**/*.entity{.ts,.js}`],
           autoLoadEntities: true,
-          keepConnectionAlive: true,
           ...config.get('db.mysql'),
           // cache: {
           //   type: 'ioredis',
@@ -72,19 +71,10 @@ import { PostModule } from './system/post/post.module'
         } as TypeOrmModuleOptions
       },
     }),
-    // libs redis
+    // libs redis(自封装 ioredis,弃用 @liaoliaots/nestjs-redis)
     RedisModule.forRootAsync(
       {
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => {
-          return {
-            closeClient: true,
-            readyLog: true,
-            errorLog: true,
-            config: config.get<RedisClientOptions>('redis'),
-          }
-        },
+        useFactory: (config: ConfigService) => config.get<RedisOptions>('redis'),
       },
       true,
     ),

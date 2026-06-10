@@ -15,6 +15,7 @@ export class AuthStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       secretOrKey: config.get('jwt.secretkey'),
+      algorithms: ['HS256'],
     })
   }
 

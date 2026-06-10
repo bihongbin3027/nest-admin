@@ -2,6 +2,9 @@
 /dist
 /node_modules
 
+# TypeScript incremental build cache（不应入仓，否则会出现"tsc 误判已最新"问题）
+*.tsbuildinfo
+
 # Logs
 logs
 *.log

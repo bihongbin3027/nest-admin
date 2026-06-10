@@ -59,8 +59,8 @@ export class PostService {
   async findList(dto: FindPostListDto): Promise<ResultData> {
     const { size, page, name, code, status } = dto
     const where = {
-      ...(!!name ? { name: Like(`%${name}%`) } : null),
-      ...(!!code ? { code: Like(`%${code}%`) } : null),
+      ...(name ? { name: Like(`%${name}%`) } : null),
+      ...(code ? { code: Like(`%${code}%`) } : null),
       ...(![null, undefined].includes(status) ? { status } : null),
     }
     const posts = await this.postRepo.findAndCount({
