@@ -10,8 +10,6 @@
  Target Server Type    : MySQL
  Target Server Version : 80027
  File Encoding         : 65001
-
- Date: 24/06/2023 17:21:51
 */
 
 SET NAMES utf8mb4;
@@ -36,8 +34,8 @@ CREATE TABLE `sys_dept`  (
 -- ----------------------------
 -- Records of sys_dept
 -- ----------------------------
-INSERT INTO `sys_dept` VALUES (1, 0, 1, 0, '2023-05-04 00:16:02.040115', '总公司', 'K科技有限公司', 'kapok');
-INSERT INTO `sys_dept` VALUES (2, 1, 1, 0, '2023-05-04 00:16:46.557000', '杭州分部', '杭州技术部', 'kapok');
+INSERT INTO `sys_dept` VALUES (1, 0, 1, 0, '2026-06-04 00:16:02.040115', '总公司', 'K科技有限公司', 'kapok');
+INSERT INTO `sys_dept` VALUES (2, 1, 1, 0, '2026-06-04 00:16:46.557000', '杭州分部', '杭州技术部', 'kapok');
 
 -- ----------------------------
 -- Table structure for sys_menu
@@ -74,7 +72,6 @@ INSERT INTO `sys_menu` VALUES (15, '关联用户/解除关联', 'perm_roles:bind
 INSERT INTO `sys_menu` VALUES (16, '添加', 'system_menus:create', 3, 0, 6);
 INSERT INTO `sys_menu` VALUES (17, '编辑', 'system_menus:edit', 3, 0, 6);
 INSERT INTO `sys_menu` VALUES (18, '删除', 'system_menus:del', 3, 0, 6);
-INSERT INTO `sys_menu` VALUES (23, '测试按钮', '123232', 3, 0, 0);
 INSERT INTO `sys_menu` VALUES (25, '部门管理', 'perm_depts', 1, 0, 2);
 INSERT INTO `sys_menu` VALUES (26, '岗位管理', 'perm_posts', 1, 0, 2);
 INSERT INTO `sys_menu` VALUES (27, '新增', 'perm_posts:create', 3, 0, 26);
@@ -144,21 +141,13 @@ CREATE TABLE `sys_oss`  (
   `user_id` bigint(0) NOT NULL COMMENT '上传用户id',
   `user_account` varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '上传用户帐号',
   `type` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '文件mimetype类型',
-  `parent_id` int(11) NULL DEFAULT 0 COMMENT '父级文件夹ID，0表示根目录'
+  `parent_id` int(11) NULL DEFAULT 0 COMMENT '父级文件夹ID，0表示根目录',
   `is_dir` tinyint(1) NULL DEFAULT 0 COMMENT '是否为文件夹：0否，1是',
-  `vector_status` varchar(20) NULL DEFAULT 'unprocessed' COMMENT '向量化状态：unprocessed未处理, processing处理中, success成功, failed失败'
+  `vector_status` varchar(20) NULL DEFAULT 'unprocessed' COMMENT '向量化状态：unprocessed未处理, processing处理中, success成功, failed失败',
   `associated_table` varchar(255) NULL DEFAULT NULL COMMENT 'Text-to-SQL 轨道专属：动态生成的物理表名',
   `rag_track` varchar(255) NULL DEFAULT NULL COMMENT 'RAG链路：VECTOR(文本向量), SQL(结构化表格)',
   PRIMARY KEY (`id`) USING BTREE
 ) ENGINE = InnoDB AUTO_INCREMENT = 6 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci ROW_FORMAT = Dynamic;
-
--- ----------------------------
--- Records of sys_oss
--- ----------------------------
-INSERT INTO `sys_oss` VALUES (1, 'http://localhost:8081/static/b37f8d762222ffbf280fa708b4b57f4a.jpg', 59975, 'D:\\programmeWork\\kapok\\nest-admin\\upload\\347811e1f6da4221a09cee7f3c7b03ce.jpeg', '2021-11-23 21:13:01.820103', '头像', 1, 'admin', 'image/jpeg');
-INSERT INTO `sys_oss` VALUES (2, 'http://localhost:8081/static/67f57d2058984103afc54d164aff5648.jpeg', 59767, 'D:\\programmeWork\\kapok\\nest-admin\\upload\\aa96fb05de9945f690e6d4b8a0f9b5e4.jpeg', '2021-11-24 19:51:01.567326', '头像', 1, 'admin', 'image/jpeg');
-INSERT INTO `sys_oss` VALUES (3, 'http://localhost:8081/static/59f38c077c758158297d70061431429b.jpg', 59516, 'D:\\programmeWork\\kapok\\nest-admin\\upload\\67f57d2058984103afc54d164aff5648.jpeg', '2021-11-24 20:31:04.633617', '头像', 1, 'admin', 'image/jpeg');
-INSERT INTO `sys_oss` VALUES (4, 'http://localhost:8081/static/用户导入模板.xlsx', 10956, 'D:\\programmeWork\\kapok\\nest-admin\\upload\\用户导入模板.xlsx', '2023-04-24 23:48:09.000000', '文档', 1, 'admin', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
 
 -- ----------------------------
 -- Table structure for sys_post
@@ -178,8 +167,8 @@ CREATE TABLE `sys_post`  (
 -- ----------------------------
 -- Records of sys_post
 -- ----------------------------
-INSERT INTO `sys_post` VALUES (2, 'hr', 0, '山东科技山东科技花生壳', 1, '2022-01-06 20:32:01.513000', '人事');
-INSERT INTO `sys_post` VALUES (3, 'it', 1, '写代码', 0, '2022-01-06 04:32:56.250000', '技术员');
+INSERT INTO `sys_post` VALUES (2, 'hr', 0, '山东科技山东科技花生壳', 1, '2026-06-06 20:32:01.513000', '人事');
+INSERT INTO `sys_post` VALUES (3, 'it', 1, '写代码', 0, '2026-06-06 20:32:56.250000', '技术员');
 
 -- ----------------------------
 -- Table structure for sys_role
@@ -197,8 +186,7 @@ CREATE TABLE `sys_role`  (
 -- ----------------------------
 -- Records of sys_role
 -- ----------------------------
-INSERT INTO `sys_role` VALUES (1, '测试', '测试橘色', '2021-11-18 21:41:50.187783', '2021-11-18 21:41:50.187783');
-INSERT INTO `sys_role` VALUES (2, '测试22', '测试呀', '2021-12-30 23:22:18.454332', '2023-06-23 01:46:20.000000');
+INSERT INTO `sys_role` VALUES (1, '普通用户', '普通用户', '2026-06-01 21:41:50.187783', '2026-06-02 21:41:50.187783');
 
 -- ----------------------------
 -- Table structure for sys_role_menu
@@ -215,27 +203,6 @@ CREATE TABLE `sys_role_menu`  (
 -- Records of sys_role_menu
 -- ----------------------------
 INSERT INTO `sys_role_menu` VALUES (1, 1, 1);
-INSERT INTO `sys_role_menu` VALUES (2, 1, 2);
-INSERT INTO `sys_role_menu` VALUES (3, 1, 3);
-INSERT INTO `sys_role_menu` VALUES (4, 1, 8);
-INSERT INTO `sys_role_menu` VALUES (5, 1, 9);
-INSERT INTO `sys_role_menu` VALUES (6, 1, 10);
-INSERT INTO `sys_role_menu` VALUES (7, 1, 11);
-INSERT INTO `sys_role_menu` VALUES (8, 1, 4);
-INSERT INTO `sys_role_menu` VALUES (9, 1, 12);
-INSERT INTO `sys_role_menu` VALUES (10, 1, 13);
-INSERT INTO `sys_role_menu` VALUES (11, 1, 14);
-INSERT INTO `sys_role_menu` VALUES (12, 1, 15);
-INSERT INTO `sys_role_menu` VALUES (13, 1, 5);
-INSERT INTO `sys_role_menu` VALUES (14, 1, 6);
-INSERT INTO `sys_role_menu` VALUES (15, 1, 16);
-INSERT INTO `sys_role_menu` VALUES (16, 1, 17);
-INSERT INTO `sys_role_menu` VALUES (17, 1, 18);
-INSERT INTO `sys_role_menu` VALUES (18, 1, 7);
-INSERT INTO `sys_role_menu` VALUES (21, 2, 2);
-INSERT INTO `sys_role_menu` VALUES (22, 2, 4);
-INSERT INTO `sys_role_menu` VALUES (23, 2, 3);
-INSERT INTO `sys_role_menu` VALUES (24, 2, 1);
 
 -- ----------------------------
 -- Table structure for sys_user
@@ -259,8 +226,8 @@ CREATE TABLE `sys_user`  (
 -- ----------------------------
 -- Records of sys_user
 -- ----------------------------
-INSERT INTO `sys_user` VALUES (1, '$2a$10$JChCYKwJYbVV4ANalu2tBenViaF3fuQGAJ1NSBOtR8HJNCV7H710i', '$2a$10$JChCYKwJYbVV4ANalu2tBe', 'admin', '18374914562', '123@qq.com', 1, 'http://localhost:8081/static/67f57d2058984103afc54d164aff5648.jpeg', 0, '2021-11-15 16:09:23.000000', '2023-04-26 15:24:39.000000');
-INSERT INTO `sys_user` VALUES (2, '$2a$10$NSrq5H2chKrcMy/AeiHqK.C1ER40JmLWCh/OIpXkL/nZ4lHN/epse', '$2a$10$NSrq5H2chKrcMy/AeiHqK.', 'test', '18374915874', '12345@qq.com', 1, 'http://localhost:8081/static/67f57d2058984103afc54d164aff5648.jpeg', 1, '2021-12-30 15:25:47.000000', '2023-06-24 17:17:06.000000');
+INSERT INTO `sys_user` VALUES (1, '$2a$10$JChCYKwJYbVV4ANalu2tBenViaF3fuQGAJ1NSBOtR8HJNCV7H710i', '$2a$10$JChCYKwJYbVV4ANalu2tBe', 'admin', '18374914562', '123@qq.com', 1, 'http://localhost:8081/static/67f57d2058984103afc54d164aff5648.jpeg', 0, '2026-06-01 16:09:23.000000', '2026-06-01 16:09:23.000000');
+INSERT INTO `sys_user` VALUES (2, '$2a$10$NSrq5H2chKrcMy/AeiHqK.C1ER40JmLWCh/OIpXkL/nZ4lHN/epse', '$2a$10$NSrq5H2chKrcMy/AeiHqK.', 'test', '18374915874', '12345@qq.com', 1, 'http://localhost:8081/static/67f57d2058984103afc54d164aff5648.jpeg', 1, '2026-06-01 15:25:47.000000', '2026-06-01 15:25:47.000000');
 
 -- ----------------------------
 -- Table structure for sys_user_dept
