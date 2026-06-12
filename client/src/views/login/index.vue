@@ -57,8 +57,10 @@
             </el-form-item>
 
             <div class="form-options">
-              <el-checkbox v-model="formData.rememberMe" label="记住此终端" />
-              <span class="forget-pwd">忘记密码？</span>
+              <el-checkbox v-model="formData.rememberMe">
+                <span>记住此终端</span>
+              </el-checkbox>
+              <!-- <span class="forget-pwd">忘记密码？</span> -->
             </div>
 
             <el-button :loading="loading" type="primary" class="login-submit-btn" @click.prevent="loginEvent">

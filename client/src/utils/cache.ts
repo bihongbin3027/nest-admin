@@ -65,8 +65,14 @@ export function setActiveThemeName(themeName: ThemeName) {
   localStorage.setItem(CacheKey.ACTIVE_THEME_NAME, themeName)
 }
 
+/**
+ * 退出登录 / 会话失效时调用。
+ * 仅清掉"会话相关"key（token、refreshToken、rt-exp），**不动**用户终端设置（主题、侧边栏、记住的账号密码）。
+ * 老实现用 `localStorage.clear()` 会把 RAG_TERMINAL_CREDENTIAL 一起干掉，
+ * 导致"记住此终端"功能在退出后失效。
+ */
 export function clearLocalStorage() {
-  const theme = getActiveThemeName()
-  localStorage.clear()
-  setActiveThemeName(theme)
+  localStorage.removeItem(CacheKey.TOKEN)
+  localStorage.removeItem(CacheKey.REFRESH_TOKEN)
+  localStorage.removeItem(CacheKey.REFRESH_TOKEN_EXP)
 }
