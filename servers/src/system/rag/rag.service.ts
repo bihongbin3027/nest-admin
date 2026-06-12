@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common'
+import { Injectable, Logger } from '@nestjs/common'
 import { InjectEntityManager } from '@nestjs/typeorm'
 import { EntityManager } from 'typeorm'
 import { ConfigService } from '@nestjs/config'
@@ -16,6 +16,7 @@ import * as mammoth from 'mammoth'
 
 @Injectable()
 export class RagService {
+  private readonly logger = new Logger(RagService.name)
   private readonly llm: ChatOpenAI
   private readonly embeddings: OpenAIEmbeddings
   private readonly qdrantUrl: string
@@ -52,8 +53,27 @@ export class RagService {
       configuration: {
         baseURL: baseURL,
       },
-      // 提示：如果使用的是国内 Embedding 模型，例如 bge-large-zh-v1.5，可以追加指定 modelName
     })
+  }
+
+  /**
+   * 🌟【完整补全】获取全量知识列表方法
+   * 包含文件夹与物理文件，严格支持虚拟网盘前端层级的动态穿透展示
+   */
+  async getKnowledgeFileList(parentId: number): Promise<any[]> {
+    return await this.entityManager
+      .createQueryBuilder()
+      .select('oss.id', 'id')
+      .addSelect('oss.file_name', 'fileName')
+      .addSelect('oss.size', 'size')
+      .addSelect('oss.rag_track', 'rag_track')
+      .addSelect('oss.vector_status', 'vectorStatus')
+      .addSelect('oss.is_dir', 'isDir')
+      .from('sys_oss', 'oss')
+      .where('oss.parent_id = :parentId', { parentId })
+      .orderBy('oss.is_dir', 'DESC')
+      .addOrderBy('oss.create_date', 'DESC')
+      .getRawMany()
   }
 
   /**
@@ -111,14 +131,24 @@ export class RagService {
   }
 
   /**
+   * 🌟【完整补全】陈旧或特定版本组件调用的注册入口
+   * 完美保持向后兼容，平滑代理映射到 registerOssMeta
+   */
+  async registerFileAndTriggerEmbedding(file: Express.Multer.File, parentId: number) {
+    this.logger.warn('[历史向前兼容激活] 正在通过老接口名称代理注册语料资产...')
+    return await this.registerOssMeta(file, parentId)
+  }
+
+  /**
    * 核心异步分流清洗管道（多线程分流，解耦主 HTTP 通道）
    */
   async asyncProcessEtlPipeline(file: Express.Multer.File, ossId: number): Promise<void> {
     try {
+      // 🛠️【核心修正】修复原代码连续 select 发生相互覆盖的底层致命 Bug，第二个字段改为 addSelect
       const meta = await this.entityManager
         .createQueryBuilder()
         .select('oss.rag_track', 'rag_track')
-        .select('oss.associated_table', 'associated_table')
+        .addSelect('oss.associated_table', 'associated_table')
         .from('sys_oss', 'oss')
         .where('oss.id = :id', { id: ossId })
         .getRawOne()
@@ -131,7 +161,7 @@ export class RagService {
 
       await this.entityManager.update('sys_oss', ossId, { vector_status: 'success' })
     } catch (error) {
-      console.error(`[RAG ETL 异步管道崩溃] OSS_ID: ${ossId}`, error)
+      this.logger.error(`[RAG ETL 异步管道崩溃] OSS_ID: ${ossId}`, error)
       await this.entityManager.update('sys_oss', ossId, { vector_status: 'failed' })
     }
   }
@@ -219,13 +249,12 @@ export class RagService {
       })
     })
 
-    // 这里直接安全地绑定构造函数中通过 yml 初始化出来的 embedding 实例与连接字符串
     await QdrantVectorStore.fromDocuments(documents, this.embeddings, {
       url: this.qdrantUrl,
       collectionName: this.collectionName,
     })
 
-    console.log(
+    this.logger.log(
       `[RAG ETL 成功] 文件 [${file.originalname}] 已完成分块，成功灌入向量集合 [${this.collectionName}] 块数: ${documents.length}`,
     )
   }
@@ -238,10 +267,11 @@ export class RagService {
     let targetTable = ''
 
     if (sources && sources.length > 0) {
+      // 🛠️【核心修正】修复原代码连续 select 发生相互覆盖的底层致命 Bug，第二个字段改为 addSelect
       const selectedSource = await this.entityManager
         .createQueryBuilder()
         .select('oss.rag_track', 'rag_track')
-        .select('oss.associated_table', 'associated_table')
+        .addSelect('oss.associated_table', 'associated_table')
         .from('sys_oss', 'oss')
         .where('oss.id = :id', { id: sources[0] })
         .getRawOne()
@@ -268,7 +298,6 @@ export class RagService {
       try {
         let relevantDocs = []
 
-        // 核心防御 1：如果前端没勾选 sources 且数据库目前空无一物，无需检索向量库，直接触发泛化熔断
         if (sources && sources.length > 0) {
           try {
             const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
@@ -285,12 +314,11 @@ export class RagService {
 
             relevantDocs = await retriever.invoke(question)
           } catch (vErr) {
-            console.log('[RAG] 向量库尚未初始化或连接失败，平滑切换至大模型接管轨道')
+            this.logger.warn('[RAG] 向量库尚未初始化或连接失败，平滑切换至大模型接管轨道')
             relevantDocs = []
           }
         }
 
-        // 核心防御 2：如果未检索到任何背景文档（如全新项目无资料库），直接平滑转入大模型通用常识回答
         if (!relevantDocs || relevantDocs.length === 0) {
           res.write(
             `data: ${JSON.stringify({ code: 200, data: '当前知识库无相关参考段落，已为您转入云端大模型泛化回答：\n\n' })}\n\n`,
@@ -298,12 +326,10 @@ export class RagService {
 
           const responseStream = await this.llm.stream(question)
 
-          // 🌟 终极核心防御 3：使用 100% 运行期安全的包裹逻辑，彻底消灭 Cannot read properties of undefined (reading 'data')
           for await (const chunk of responseStream) {
             if (!chunk) continue
 
             let content = ''
-            // 极其严密地动态嗅探任何可能的文本节点，确保绝不触发 undefined 属性读取
             if (typeof chunk === 'string') {
               content = chunk
             } else if (typeof chunk === 'object') {
@@ -315,7 +341,6 @@ export class RagService {
             }
           }
         } else {
-          // 存在本地语料资产时的正常召回合并逻辑
           const contextText = relevantDocs
             .map((doc) => `【出处: ${doc.metadata?.fileName || '未知文件'}】\n${doc.pageContent}`)
             .join('\n\n')
@@ -330,7 +355,6 @@ export class RagService {
             ['human', question],
           ])
 
-          // 🌟 终极核心防御 4：同步防御正常召回分支下的流迭代器
           for await (const chunk of responseStream) {
             if (!chunk) continue
 
@@ -347,16 +371,31 @@ export class RagService {
           }
         }
       } catch (err) {
-        // 🌟 核心防线：这里发生任何偶发性断连，通过数据流把错误变成普通的 500 流消息推给前端
-        // 绝对不能向上 throw 惊动 Nest 的 exceptions-filter.ts，避免二次污染 Headers
-        console.error('[RAG 运行流内部异常捕捉并安全消化]', err)
+        this.logger.error('[RAG 运行流内部异常捕捉并安全消化]', err)
         const errorDetails = err instanceof Error ? err.message : '大模型集群响应超时'
         res.write(`data: ${JSON.stringify({ code: 500, data: `\n[系统决策阻断]: ${errorDetails}` })}\n\n`)
       }
 
-      // 正确收尾 SSE 通道
       res.write('data: {"code": 200, "data": ""}\n\n')
       res.end()
     }
+  }
+
+  /**
+   * 🌟【完整补全】获取已成功构建索引的文件清单（备用别名映射接口）
+   * 与 Controller 内部直接编写的方法数据检索逻辑 100% 同构对齐
+   */
+  async getActivatedFiles(): Promise<any[]> {
+    return await this.entityManager
+      .createQueryBuilder()
+      .select('oss.id', 'id')
+      .addSelect('oss.file_name', 'fileName')
+      .addSelect('oss.size', 'size')
+      .addSelect('oss.rag_track', 'rag_track')
+      .from('sys_oss', 'oss')
+      .where('oss.is_dir = 0')
+      .andWhere('oss.vector_status = :status', { status: 'success' })
+      .orderBy('oss.create_date', 'DESC')
+      .getRawMany()
   }
 }
