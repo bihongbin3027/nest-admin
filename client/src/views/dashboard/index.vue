@@ -131,9 +131,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Collection, Delete, User, Position, DataAnalysis, DocumentCopy, CircleCheck } from '@element-plus/icons-vue'
-import { marked } from 'marked' // 需要执行 npm i marked 确保代码与高亮样式正确编译
-
-// 🌟 100% 引入使用 Axios 封装的 RAG 核心 API 服务模块
+import { marked } from 'marked'
 import { getKnowledgeFilesApi, clearKnowledgeSessionApi, askQuestionStreamApi } from '@/api/rag'
 
 interface SourceFile {
@@ -157,7 +155,7 @@ const streamingActive = ref(false)
 const sourcesLoading = ref(false)
 const scrollbarRef = ref()
 
-// 1. 初始化拉取知识语料（使用全局拦截的 Axios 请求）
+// 初始化拉取知识语料（使用全局拦截的 Axios 请求）
 const fetchKnowledgeSources = async () => {
   sourcesLoading.value = true
   try {
@@ -195,7 +193,7 @@ const handleEnterKey = (e: KeyboardEvent) => {
   }
 }
 
-// 2. 核心大厂级：使用 Axios 流式泵字处理层
+// 使用 Axios 流式泵字处理层
 const submitQuery = async () => {
   const query = inputQuery.value.trim()
   if (!query || streamingActive.value) return
@@ -270,7 +268,6 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* 🎨 保持之前输出的大厂高端质感、极简主义 Glassmorphism 配色系统 */
 .dashboard-chat-container {
   display: flex;
   height: calc(100vh - 90px);

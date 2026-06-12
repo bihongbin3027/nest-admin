@@ -18,7 +18,7 @@
     "countup.js": "^2.6.2",
     "dayjs": "^1.11.8",
     "echarts": "^5.4.2",
-    "element-plus": "2.3.7",
+    "element-plus": "^2.4.0",
     "jwt-decode": "^3.1.2",
     "marked": "^18.0.5",
     "normalize.css": "^8.0.1",

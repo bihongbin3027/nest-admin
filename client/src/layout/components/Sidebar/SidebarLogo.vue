@@ -1,9 +1,9 @@
 <template>
   <div class="sidebar-logo-container" :class="{ collapse: props.collapse }">
     <router-link to="/">
-      <svg-icon name="nest-logo" class="sidebar-logo"></svg-icon>
+      <!-- <svg-icon name="nest-logo" class="sidebar-logo"></svg-icon> -->
       <transition name="sidebar-logo">
-        <div class="sidebar-logo-text">Nest-Admin</div>
+        <div class="sidebar-logo-text">智能助手</div>
       </transition>
     </router-link>
   </div>

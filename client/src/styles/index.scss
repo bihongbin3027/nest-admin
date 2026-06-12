@@ -1,9 +1,9 @@
-@import "./variables.scss";
-@import "./transition.scss";
-@import "./mixins.scss";
+@import './variables.scss';
+@import './transition.scss';
+@import './mixins.scss';
 @import './nprogress.scss';
 // 注册多主题
-@import "./theme/register.scss";
+@import './theme/register.scss';
 
 @font-face {
   font-family: 'app-name-font';
@@ -12,18 +12,68 @@
   font-weight: normal;
 }
 
-
 html {
   height: 100%;
+}
+
+// 默认明亮模式
+html.normal {
+  --login-bg: #f8fafc;
+  --login-wrapper-bg: rgba(255, 255, 255, 0.55);
+  --login-wrapper-border: rgba(255, 255, 255, 0.7);
+  --login-card-bg: rgba(255, 255, 255, 0.75);
+  --login-brand-bg: linear-gradient(135deg, rgba(99, 102, 241, 0.06) 0%, rgba(168, 85, 247, 0.02) 100%);
+  --login-text-main: #0f172a;
+  --login-text-sub: #475569;
+  --login-input-bg: rgba(255, 255, 255, 0.85);
+  --login-input-border: #cbd5e1;
+  --login-input-text: #0f172a;
+  --login-primary-btn: linear-gradient(90deg, #6366f1 0%, #a855f7 100%);
+  --login-glow-1: rgba(99, 102, 241, 0.2);
+  --login-glow-2: rgba(236, 72, 153, 0.15);
+}
+
+// 纯黑极客模式
+html.dark {
+  --login-bg: #090d16;
+  --login-wrapper-bg: rgba(15, 22, 42, 0.25);
+  --login-wrapper-border: rgba(255, 255, 255, 0.06);
+  --login-card-bg: rgba(30, 41, 59, 0.4);
+  --login-brand-bg: linear-gradient(135deg, rgba(79, 70, 229, 0.12) 0%, rgba(124, 58, 237, 0.03) 100%);
+  --login-text-main: #ffffff;
+  --login-text-sub: #64748b;
+  --login-input-bg: rgba(255, 255, 255, 0.03);
+  --login-input-border: rgba(255, 255, 255, 0.08);
+  --login-input-text: #ffffff;
+  --login-primary-btn: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%);
+  --login-glow-1: rgba(79, 70, 229, 0.4);
+  --login-glow-2: rgba(124, 58, 237, 0.35);
+}
+
+// 科幻深蓝模式
+html.dark-blue {
+  --login-bg: #051124;
+  --login-wrapper-bg: rgba(10, 31, 64, 0.3);
+  --login-wrapper-border: rgba(30, 144, 255, 0.15);
+  --login-card-bg: rgba(11, 41, 79, 0.55);
+  --login-brand-bg: linear-gradient(135deg, rgba(0, 191, 255, 0.12) 0%, rgba(30, 144, 255, 0.04) 100%);
+  --login-text-main: #f1f5f9;
+  --login-text-sub: #38bdf8;
+  --login-input-bg: rgba(0, 191, 255, 0.03);
+  --login-input-border: rgba(0, 191, 255, 0.25);
+  --login-input-text: #f0fdfa;
+  --login-primary-btn: linear-gradient(90deg, #00bfff 0%, #1e90ff 100%);
+  --login-glow-1: rgba(0, 191, 255, 0.45);
+  --login-glow-2: rgba(5, 255, 180, 0.25);
 }
 
 body {
   height: 100%;
   background-color: var(--theme-bg-color, #f0f2f5);
-  color: rgba(0, 0, 0, .65);
+  color: rgba(0, 0, 0, 0.65);
   -moz-osx-font-smoothing: grayscale;
   -webkit-font-smoothing: antialiased;
-  font-family: "Helvetica Neue", Helvetica, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "微软雅黑", Arial,
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', '微软雅黑', Arial,
     sans-serif;
 }
 
@@ -43,7 +93,8 @@ body {
   box-sizing: border-box;
 }
 
-ol, ul {
+ol,
+ul {
   list-style: none;
 }
 
@@ -56,7 +107,7 @@ a,
 a:focus,
 a:hover {
   cursor: pointer;
-  color: rgba(0, 0, 0, .65);
+  color: rgba(0, 0, 0, 0.65);
   text-decoration: none;
 }
 
@@ -65,7 +116,7 @@ div:focus {
 }
 
 .el-menu-item.is-active {
-  background-color: var(--el-menu-active-bg-color)
+  background-color: var(--el-menu-active-bg-color);
 }
 
 // 分页
@@ -98,7 +149,6 @@ div:focus {
 .box-bg-active {
   background-color: #fff;
 }
-
 
 /*  搜索条件 */
 .filter-container {
@@ -133,11 +183,7 @@ div:focus {
 }
 ::-webkit-scrollbar-thumb {
   height: 50px;
-  background-image: linear-gradient(
-    rgba(173, 15, 15, 0),
-    rgb(119, 153, 250),
-    rgba(173, 15, 15, 0)
-  );
+  background-image: linear-gradient(rgba(173, 15, 15, 0), rgb(119, 153, 250), rgba(173, 15, 15, 0));
   border-radius: 6px;
   filter: alpha(opacity = 10);
   -moz-opacity: 0.1;
@@ -145,11 +191,7 @@ div:focus {
   opacity: 0.1;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background-image: linear-gradient(
-    rgba(255, 255, 255, 0),
-    rgb(72, 120, 253),
-    rgba(255, 255, 255, 0)
-  );
+  background-image: linear-gradient(rgba(255, 255, 255, 0), rgb(72, 120, 253), rgba(255, 255, 255, 0));
 }
 * {
   scrollbar-color: #c8d2e0 #f3f4f9;
