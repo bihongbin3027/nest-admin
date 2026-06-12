@@ -30,7 +30,7 @@ export class OssEntity {
 
   @ApiProperty({ description: '原始文件名(RAG模块专属)' })
   @Column({ type: 'varchar', name: 'file_name', comment: '原始文件名(RAG模块专属)' })
-  public file_name: number
+  public fileName: number
 
   @ApiProperty({ description: '父级文件夹ID，0表示根目录' })
   @Column({ type: 'int', name: 'parent_id', comment: '父级文件夹ID，0表示根目录' })

@@ -85,7 +85,9 @@ export class RoleService {
     })
     if (!affected) return ResultData.fail(AppHttpCode.SERVICE_ERROR, '当前角色更新失败，请稍后尝试')
     // 更新角色，redis 因为角色还在，只需要更新用户菜单，用户接口权
-    await this.permService.clearUserInfoCache('nest:user:[menu|perm]*')
+    // 注意：传 SCAN 的 glob 模式，不是正则。'nest:user:menu*' / 'nest:user:perm*' 才能精确匹配到对应 key
+    await this.permService.clearUserInfoCache('nest:user:menu*')
+    await this.permService.clearUserInfoCache('nest:user:perm*')
     return ResultData.ok()
   }
 

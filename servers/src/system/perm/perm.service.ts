@@ -127,17 +127,24 @@ export class PermService {
 
   /**
    * 遍历所有 符合的 key
-   *
-   * @returns
+   * @param match Redis SCAN 的 MATCH 模式（**glob**，不是正则）。
+   *               - 默认清空全部用户权限相关缓存（菜单/角色/接口权限/用户信息）
+   *               - 传空串会落到默认值
    */
   private async traversePermKeys(match?: string) {
-    // const [cursor, elements] = await this.redisService.getClient().scan(0, 'MATCH', 'nest:user:[menu|role]*')
+    // const [cursor, elements] = await this.redisService.getClient().scan(0, 'MATCH', 'nest:user:*')
     const keys: string[] = []
+    // SCAN 的 MATCH 是 glob 模式：'*' 任意串、'?' 单字符、'{}' 多个子串、'[]' 字符类
+    // 注意：'[...]' 只能匹配单字符（字符类），不是正则里的'或'语义。
+    // 旧代码写 'nest:user:[menu|perm]*' 在 glob 里只能匹配第三段为单字符的 key，
+    // 实际缓存 key 'nest:user:menu:2' / 'nest:user:perm:2' 第三段是 4 字符 → 永远匹配不到 → 缓存清不掉
+    // 改成下面这种 glob 安全的写法
+    const finalMatch = match && match.length > 0 ? match : 'nest:user:*'
     let _cursor = ''
     while (_cursor !== '0') {
       const [cursor, elements] = await this.redisService
         .getClient()
-        .scan(_cursor || '0', 'MATCH', match || 'nest:user:[menu|role|perm]*', 'COUNT', this.TRAVERSE_MAX_VALUE)
+        .scan(_cursor || '0', 'MATCH', finalMatch, 'COUNT', this.TRAVERSE_MAX_VALUE)
       const _elements = !this.REDIS_PREFIX ? elements : elements.map((ele) => ele.replace(this.REDIS_PREFIX, ''))
       keys.push(..._elements)
       _cursor = cursor
