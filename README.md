@@ -75,15 +75,3 @@ npm run start:dev
 * [X] 岗位管理
 * [X] 菜单管理
 * [X] 文件上传（当前只完成上传本地，未兼容 oss）
-
-#### 效果图
-
-![image](./upload/user.png)
-
-![image](./upload/dept.png)
-
-![image](./upload/role.png)
-
-![image](./upload/menu.png)
-
-![image](./upload//oss.png)
