@@ -304,4 +304,24 @@ CREATE TABLE `sys_user_role`  (
 INSERT INTO `sys_user_role` VALUES (33, 2, 2);
 INSERT INTO `sys_user_role` VALUES (34, 2, 1);
 
+-- ----------------------------
+-- Records of sys_rag_file
+-- ----------------------------
+CREATE TABLE `sys_rag_file` (
+  `id` int NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  `fileName` varchar(255) NOT NULL COMMENT '文件/文件夹名称',
+  `parentId` int NOT NULL DEFAULT '0' COMMENT '父级ID，0代表根目录',
+  `isFolder` tinyint NOT NULL DEFAULT '0' COMMENT '是否为文件夹：0否，1是',
+  `fileUrl` varchar(100) DEFAULT NULL COMMENT '存储在OSS的Key或路径',
+  `size` bigint NOT NULL DEFAULT '0' COMMENT '文件大小(Byte)',
+  `fileType` varchar(20) DEFAULT NULL COMMENT '文件后缀名',
+  `ragTrack` enum('SQL','VECTOR') NOT NULL DEFAULT 'VECTOR' COMMENT 'RAG算力轨制',
+  `vectorStatus` enum('PENDING','PROCESSING','SUCCESS','FAILED') NOT NULL DEFAULT 'PENDING' COMMENT '向量化清洗状态',
+  `errorMessage` text DEFAULT NULL COMMENT '异步清洗崩溃日志',
+  `createdAt` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+  `updatedAt` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  KEY `IDX_PARENT_ID` (`parentId`) COMMENT '加快层级目录检索速度'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='企业级双轨制核心知识库资产表';
+
 SET FOREIGN_KEY_CHECKS = 1;

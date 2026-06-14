@@ -5,7 +5,7 @@ import { mw as requestIpMw } from 'request-ip'
 import express from 'express'
 import path from 'path'
 
-import { NestFactory } from '@nestjs/core'
+import { NestFactory, Reflector } from '@nestjs/core'
 import { ValidationPipe } from '@nestjs/common'
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger'
 import { ConfigService } from '@nestjs/config'
@@ -25,6 +25,8 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     cors: true,
   })
+
+  const reflector = app.get(Reflector)
 
   // 反向代理场景下需要显式声明 trust proxy,express-rate-limit/request-ip/rate-limit 等中间件依赖 req.ip
   // 详见 https://expressjs.com/en/guide/behind-proxies.html
@@ -84,7 +86,7 @@ async function bootstrap() {
   app.use(express.urlencoded({ extended: true }))
   app.use(logger)
   // 使用全局拦截器打印出参
-  app.useGlobalInterceptors(new TransformInterceptor())
+  app.useGlobalInterceptors(new TransformInterceptor(reflector))
   // 所有异常
   app.useGlobalFilters(new ExceptionsFilter())
   app.useGlobalFilters(new HttpExceptionsFilter())

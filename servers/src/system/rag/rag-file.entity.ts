@@ -13,8 +13,8 @@ export enum VectorStatusEnum {
   FAILED = 'FAILED', // 向量化失败
 }
 
-@Entity({ name: 'rag_knowledge_file' })
-export class RagKnowledgeFileEntity {
+@Entity({ name: 'sys_rag_file' })
+export class RagFileEntity {
   @PrimaryGeneratedColumn({ comment: '主键ID' })
   id: number
 

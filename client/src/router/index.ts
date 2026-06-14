@@ -42,6 +42,25 @@ export const asyncRoutes: RouteRecordRaw[] = [
     ]
   },
   {
+    path: '/rag-dir',
+    component: shallowRef(Layout),
+    name: 'rag-dir',
+    redirect: '/rag-dir/rag',
+    meta: {
+      title: 'RAG管理',
+      icon: 'file-doc',
+      alwayShow: true
+    },
+    children: [
+      {
+        path: 'rag',
+        name: 'rag',
+        component: () => import('@/views/rag/index.vue'),
+        meta: { title: '知识库资源管理' }
+      }
+    ]
+  },
+  {
     path: '/perm',
     component: shallowRef(Layout),
     name: 'perm',

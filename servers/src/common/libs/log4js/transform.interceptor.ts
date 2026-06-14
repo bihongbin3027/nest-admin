@@ -1,21 +1,34 @@
 import { CallHandler, ExecutionContext, NestInterceptor, Injectable } from '@nestjs/common'
+import { Reflector } from '@nestjs/core'
 import { Observable } from 'rxjs'
 import { map } from 'rxjs/operators'
 import { Logger } from './log4j.util'
+import { KEEP_KEY } from '../../../common/decorators/keep.decorator'
 
 @Injectable()
 export class TransformInterceptor implements NestInterceptor {
+  constructor(private readonly reflector: Reflector) {}
+
   intercept(context: ExecutionContext, next: CallHandler<any>): Observable<any> | Promise<Observable<any>> {
+    const isKeep = this.reflector.getAllAndOverride<boolean>(KEEP_KEY, [context.getHandler(), context.getClass()])
+
+    if (isKeep) {
+      return next.handle()
+    }
+
     const req = context.getArgByIndex(1).req
+
     return next.handle().pipe(
       map((data) => {
+        const safeData = data && typeof data === 'object' && 'data' in data ? data.data : data
+
         const logFormat = `
 ##############################################################################################################
 Request original url: ${req.originalUrl}
 Method: ${req.method}
 IP: ${req.ip}
-User: ${JSON.stringify(req.user)}
-Response data: ${JSON.stringify(data.data)}
+User: ${JSON.stringify(req.user || 'Guest')}
+Response data: ${JSON.stringify(safeData || 'Stream/NoContent')}
 ##############################################################################################################
 `
         Logger.info(logFormat)
