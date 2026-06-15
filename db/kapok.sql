@@ -324,4 +324,31 @@ CREATE TABLE `sys_rag_file` (
   KEY `IDX_PARENT_ID` (`parentId`) COMMENT '加快层级目录检索速度'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='企业级双轨制核心知识库资产表';
 
+-- ----------------------------
+-- P1-2 多轮会话主表
+-- ----------------------------
+CREATE TABLE `sys_rag_session` (
+  `id` int NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  `user_id` int NOT NULL COMMENT '所属用户 ID',
+  `title` varchar(255) NOT NULL DEFAULT '新会话' COMMENT '会话标题（首条用户消息前 24 字自动生成，可手动改）',
+  `create_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+  `update_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  KEY `IDX_RAG_SESSION_USER` (`user_id`, `update_at`) COMMENT '用户维度倒序翻页'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='RAG 多轮会话主表';
+
+-- ----------------------------
+-- P1-2 会话消息流水表
+-- ----------------------------
+CREATE TABLE `sys_rag_message` (
+  `id` int NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  `session_id` int NOT NULL COMMENT '所属会话 ID',
+  `role` varchar(20) NOT NULL COMMENT '角色: user | assistant',
+  `content` longtext NOT NULL COMMENT '消息正文（Markdown）',
+  `citations` json DEFAULT NULL COMMENT '引用源列表（仅 assistant 消息）',
+  `create_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
+  PRIMARY KEY (`id`),
+  KEY `IDX_RAG_MSG_SESSION` (`session_id`, `create_at`) COMMENT '按会话正序拉取'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='RAG 会话消息流水表';
+
 SET FOREIGN_KEY_CHECKS = 1;

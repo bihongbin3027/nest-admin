@@ -1,51 +1,117 @@
 <template>
   <div class="dashboard-chat-container">
+    <!-- 🌟【P1-2】左侧栏：会话列表 + 知识源选择 -->
     <div class="knowledge-sidebar">
-      <div class="sidebar-header">
-        <el-icon class="brand-icon"><Collection /></el-icon>
-        <span class="brand-title">企业资产知识库</span>
+      <!-- 会话区 -->
+      <div class="sidebar-section sidebar-session">
+        <div class="section-header">
+          <el-icon class="brand-icon"><ChatLineRound /></el-icon>
+          <span class="brand-title">多轮对话</span>
+          <el-button class="new-chat-btn" text @click="startNewChat" :disabled="streamingActive">
+            <el-icon><Plus /></el-icon>
+          </el-button>
+        </div>
+        <div class="session-list-wrapper" v-loading="sessionsLoading">
+          <el-scrollbar>
+            <div
+              v-for="s in sessions"
+              :key="s.id"
+              class="session-item"
+              :class="{ 'is-active': s.id === sessionId }"
+              @click="switchSession(s.id)"
+            >
+              <el-icon class="session-icon"><ChatLineSquare /></el-icon>
+              <span class="session-title" :title="s.title">{{ s.title || '新会话' }}</span>
+
+              <div class="session-actions">
+                <el-tooltip content="删除会话" placement="top" :show-after="300">
+                  <span
+                    class="session-action-btn session-action-delete"
+                    :class="{ 'is-busy': deletingId === s.id }"
+                    @click.stop="confirmDeleteSession(s)"
+                  >
+                    <el-icon :size="14">
+                      <component :is="deletingId === s.id ? Loading : Delete" />
+                    </el-icon>
+                  </span>
+                </el-tooltip>
+
+                <el-dropdown trigger="click" @command="(cmd: string) => handleSessionCmd(cmd, s)">
+                  <button
+                    type="button"
+                    class="session-action-btn session-action-more"
+                    aria-label="更多操作"
+                    @click.stop
+                  >
+                    <el-icon :size="14"><MoreFilled /></el-icon>
+                  </button>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="rename">
+                        <el-icon><Edit /></el-icon> 重命名
+                      </el-dropdown-item>
+                      <el-dropdown-item command="delete" divided>
+                        <el-icon><Delete /></el-icon> 删除会话
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+              </div>
+            </div>
+            <el-empty
+              v-if="!sessionsLoading && sessions.length === 0"
+              description="还没有会话，发送第一条问题即可创建"
+              :image-size="60"
+            />
+          </el-scrollbar>
+        </div>
       </div>
 
-      <div class="sidebar-hint">勾选下方的企业语料，AI 将限定在选定的资产范围内执行精准双轨检索。</div>
-
-      <div class="source-list-wrapper" v-loading="sourcesLoading">
-        <el-scrollbar>
-          <div
-            v-for="item in sourceFiles"
-            :key="item.id"
-            class="source-item-card"
-            :class="{ 'is-active': selectedSources.includes(item.id) }"
-            @click="toggleSource(item.id)"
-          >
-            <div class="item-meta">
-              <el-checkbox
-                :model-value="selectedSources.includes(item.id)"
-                @change="toggleSource(item.id)"
-                @click.stop
-              />
-              <div class="file-info">
-                <span class="file-name" :title="item.fileName">{{ item.fileName }}</span>
-                <div class="file-tags">
-                  <el-tag size="small" :type="item.ragTrack === 'sql' ? 'success' : 'primary'" effect="plain">
-                    {{ item.ragTrack === 'sql' ? '结构化报表' : '长文本向量' }}
-                  </el-tag>
-                  <span class="file-size">{{ formatSize(item.size) }}</span>
+      <!-- 知识源区 -->
+      <div class="sidebar-section sidebar-source">
+        <div class="section-header">
+          <el-icon class="brand-icon"><Collection /></el-icon>
+          <span class="brand-title">知识源</span>
+          <span class="section-meta">{{ selectedSources.length }} / {{ sourceFiles.length }}</span>
+        </div>
+        <div class="sidebar-hint">勾选下方的企业语料，AI 将限定在选定资产范围内执行精准双轨检索。</div>
+        <div class="source-list-wrapper" v-loading="sourcesLoading">
+          <el-scrollbar>
+            <div
+              v-for="item in sourceFiles"
+              :key="item.id"
+              class="source-item-card"
+              :class="{ 'is-active': selectedSources.includes(item.id) }"
+              @click="toggleSource(item.id)"
+            >
+              <div class="item-meta">
+                <el-checkbox
+                  :model-value="selectedSources.includes(item.id)"
+                  @change="toggleSource(item.id)"
+                  @click.stop
+                />
+                <div class="file-info">
+                  <span class="file-name" :title="item.fileName">{{ item.fileName }}</span>
+                  <div class="file-tags">
+                    <el-tag size="small" :type="item.ragTrack === 'sql' ? 'success' : 'primary'" effect="plain">
+                      {{ item.ragTrack === 'sql' ? '结构化报表' : '长文本向量' }}
+                    </el-tag>
+                    <span class="file-size">{{ formatSize(item.size) }}</span>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-
-          <el-empty v-if="sourceFiles.length === 0" description="暂无语料，请让管理员在网盘中上传" :image-size="60" />
-        </el-scrollbar>
-      </div>
-
-      <div class="sidebar-footer">
-        <el-button class="action-btn" plain @click="clearSession">
-          <el-icon><Delete /></el-icon>清空当前上下文
-        </el-button>
+            <el-empty
+              v-if="!sourcesLoading && sourceFiles.length === 0"
+              description="暂无语料，请让管理员在网盘中上传"
+              :image-size="60"
+            />
+          </el-scrollbar>
+        </div>
       </div>
     </div>
 
+    <!-- 右侧主区 -->
     <div class="chat-main-terminal">
       <div class="chat-scroller-body">
         <el-scrollbar ref="scrollbarRef">
@@ -86,7 +152,6 @@
                 </div>
                 <div class="bubble-content" v-html="renderMarkdown(msg.content)"></div>
 
-                <!-- 🌟【P1-1 引用源】气泡下方渲染引用卡片 -->
                 <div v-if="msg.role === 'assistant' && msg.sources && msg.sources.length > 0" class="citations-wrapper">
                   <div class="citations-header" @click="toggleCitations(index)">
                     <el-icon class="citations-icon"><Paperclip /></el-icon>
@@ -99,7 +164,12 @@
 
                   <transition name="citations-fade">
                     <div v-show="msg.sourcesExpanded" class="citations-list">
-                      <div v-for="(src, i) in msg.sources" :key="`${index}-${i}`" class="citation-card">
+                      <div
+                        v-for="(src, i) in msg.sources"
+                        :key="`${index}-${i}`"
+                        class="citation-card"
+                        @click="openCitationPreview(src)"
+                      >
                         <div class="citation-head">
                           <span class="citation-index">[{{ i + 1 }}]</span>
                           <el-icon class="citation-file-icon"><Document /></el-icon>
@@ -113,7 +183,9 @@
                         <div class="citation-meta">
                           <span class="meta-chunk">切片 #{{ src.chunkIndex }}</span>
                           <span class="meta-divider">·</span>
-                          <span class="meta-tip">点击卡片可在知识库查看原文</span>
+                          <span class="meta-tip">
+                            <el-icon><View /></el-icon> 点击预览原文
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -158,15 +230,55 @@
         <div class="brand-copyright">企业级知识大脑 RAG 终端 · 所有对话均通过后端安全审计守卫</div>
       </div>
     </div>
+
+    <!-- 🌟【P1-2】引用原文预览弹窗 -->
+    <el-dialog
+      v-model="previewVisible"
+      :title="previewCitation?.fileName || '引用原文预览'"
+      width="640px"
+      append-to-body
+      class="citation-preview-dialog"
+    >
+      <div v-if="previewCitation" class="preview-content">
+        <div class="preview-meta">
+          <el-icon><Document /></el-icon>
+          <span class="preview-filename">{{ previewCitation.fileName }}</span>
+          <span class="preview-divider">·</span>
+          <span class="preview-chunk">切片 #{{ previewCitation.chunkIndex }}</span>
+          <span v-if="previewCitation.score !== null" class="preview-score">
+            <span class="score-dot"></span>
+            相关度 {{ formatScore(previewCitation.score) }}
+          </span>
+        </div>
+        <div class="preview-body">
+          {{ previewCitation.content }}
+        </div>
+        <div class="preview-tip">
+          <el-icon><InfoFilled /></el-icon>
+          引用片段最多展示 280 字；如需查看完整原文，请在知识库管理中打开该文件。
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="previewVisible = false">关闭</el-button>
+        <el-button type="primary" @click="goToRagManagement">前往知识库</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRouter } from 'vue-router'
 import {
-  Collection,
+  ChatLineRound,
+  ChatLineSquare,
+  Plus,
+  MoreFilled,
+  Edit,
   Delete,
+  Loading,
+  Collection,
   User,
   Position,
   DataAnalysis,
@@ -174,10 +286,22 @@ import {
   CircleCheck,
   Document,
   Paperclip,
-  ArrowDown
+  ArrowDown,
+  View,
+  InfoFilled
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
-import { getKnowledgeFileList, askQuestionStreamApi, type RagAssetItem, type CitationItem } from '@/api/rag'
+import {
+  getKnowledgeFileList,
+  askQuestionStreamApi,
+  listRagSessions,
+  listRagSessionMessages,
+  renameRagSession,
+  deleteRagSession,
+  type RagAssetItem,
+  type CitationItem,
+  type RagSessionItem
+} from '@/api/rag'
 
 interface SourceFile {
   id: number
@@ -190,20 +314,32 @@ interface SourceFile {
 interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
-  // 🌟【P1-1】引用源列表，由后端 SSE 的 code:'sources' 事件回填
   sources?: CitationItem[]
-  // 引用卡片展开状态
   sourcesExpanded?: boolean
 }
 
+const router = useRouter()
+
+// 知识源
 const sourceFiles = ref<SourceFile[]>([])
 const selectedSources = ref<number[]>([])
+const sourcesLoading = ref(false)
+
+// 会话
+const sessions = ref<RagSessionItem[]>([])
+const sessionId = ref<number | null>(null)
+const sessionsLoading = ref(false)
+const deletingId = ref<number | null>(null)
+
+// 对话
 const chatHistory = ref<ChatMessage[]>([])
 const inputQuery = ref('')
-const sessionId = ref<string>('')
 const streamingActive = ref(false)
-const sourcesLoading = ref(false)
 const scrollbarRef = ref()
+
+// 🌟【P1-2】引用预览弹窗
+const previewVisible = ref(false)
+const previewCitation = ref<CitationItem | null>(null)
 
 const fetchKnowledgeSources = async () => {
   sourcesLoading.value = true
@@ -226,18 +362,130 @@ const fetchKnowledgeSources = async () => {
   }
 }
 
+const fetchSessions = async () => {
+  sessionsLoading.value = true
+  try {
+    const res: any = await listRagSessions()
+    sessions.value = (res?.data ?? res ?? []) as RagSessionItem[]
+  } catch (err) {
+    console.error('会话列表拉取失败', err)
+  } finally {
+    sessionsLoading.value = false
+  }
+}
+
+const switchSession = async (id: number) => {
+  if (id === sessionId.value) return
+  if (streamingActive.value) {
+    ElMessage.warning('流式输出中，请等待本次回答完成')
+    return
+  }
+  sessionId.value = id
+  await loadSessionMessages(id)
+}
+
+const loadSessionMessages = async (id: number) => {
+  try {
+    const res: any = await listRagSessionMessages(id)
+    const list: any[] = (res?.data ?? res ?? []) as any[]
+    chatHistory.value = list.map((m) => ({
+      role: m.role,
+      content: m.content,
+      sources: m.citations || undefined,
+      sourcesExpanded: true
+    }))
+    await nextTick()
+    await scrollToBottom()
+  } catch (err) {
+    console.error('加载会话消息失败', err)
+    ElMessage.error('加载历史消息失败')
+  }
+}
+
+const startNewChat = () => {
+  if (streamingActive.value) {
+    ElMessage.warning('流式输出中，请等待完成')
+    return
+  }
+  sessionId.value = null
+  chatHistory.value = []
+  inputQuery.value = ''
+}
+
+const handleSessionCmd = async (cmd: string, s: RagSessionItem) => {
+  if (cmd === 'rename') {
+    try {
+      const { value } = await ElMessageBox.prompt('重命名会话', '会话管理', {
+        inputValue: s.title,
+        confirmButtonText: '保存',
+        cancelButtonText: '取消'
+      })
+      if (value && value.trim() && value !== s.title) {
+        await renameRagSession(s.id, value.trim())
+        s.title = value.trim()
+        ElMessage.success('已重命名')
+      }
+    } catch {
+      /* 用户取消 */
+    }
+  } else if (cmd === 'delete') {
+    await confirmDeleteSession(s)
+  }
+}
+
+const confirmDeleteSession = async (s: RagSessionItem) => {
+  if (streamingActive.value) {
+    ElMessage.warning('流式输出中，请等待本次回答完成')
+    return
+  }
+  if (deletingId.value !== null) return
+  try {
+    await ElMessageBox.confirm(`确定删除会话 [${s.title || '新会话'}] 吗？该操作不可恢复。`, '安全警告', {
+      confirmButtonText: '确认删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+      confirmButtonClass: 'el-button--danger'
+    })
+  } catch {
+    return
+  }
+  deletingId.value = s.id
+  try {
+    await deleteRagSession(s.id)
+    ElMessage.success('会话已删除')
+    if (sessionId.value === s.id) {
+      sessionId.value = null
+      chatHistory.value = []
+    }
+    await fetchSessions()
+  } catch (err: any) {
+    ElMessage.error(err?.message || '删除失败，请稍后重试')
+  } finally {
+    deletingId.value = null
+  }
+}
+
 const toggleSource = (id: number) => {
   const index = selectedSources.value.indexOf(id)
-  if (index > -1) {
-    selectedSources.value.splice(index, 1)
-  } else {
-    selectedSources.value.push(id)
-  }
+  if (index > -1) selectedSources.value.splice(index, 1)
+  else selectedSources.value.push(id)
 }
 
 const toggleCitations = (index: number) => {
   const msg = chatHistory.value[index]
   if (msg) msg.sourcesExpanded = !msg.sourcesExpanded
+}
+
+const openCitationPreview = (src: CitationItem) => {
+  previewCitation.value = src
+  previewVisible.value = true
+}
+
+const goToRagManagement = () => {
+  previewVisible.value = false
+  router.push('/rag-dir/rag').catch(() => {
+    /* 已在 RAG 页时静默 */
+  })
 }
 
 const quickQuestion = (text: string) => {
@@ -246,9 +494,7 @@ const quickQuestion = (text: string) => {
 
 const handleEnterKey = (e: KeyboardEvent) => {
   if (e.shiftKey) return
-  if (!streamingActive.value && inputQuery.value.trim()) {
-    submitQuery()
-  }
+  if (!streamingActive.value && inputQuery.value.trim()) submitQuery()
 }
 
 const submitQuery = async () => {
@@ -272,13 +518,27 @@ const submitQuery = async () => {
     await askQuestionStreamApi(
       {
         question: query,
-        sessionId: sessionId.value || undefined,
+        sessionId: sessionId.value,
         sources: selectedSources.value
       },
       {
         onChunk: async (chunkedText) => {
           chatHistory.value[aiMessageIndex].content = chunkedText
           await scrollToBottom()
+        },
+        onSession: (s) => {
+          // 后端为本次创建了新会话，绑到本地
+          sessionId.value = s.id
+          // 插入到会话列表顶部
+          if (!sessions.value.find((x) => x.id === s.id)) {
+            sessions.value.unshift({
+              id: s.id,
+              userId: 0,
+              title: s.title,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            })
+          }
         },
         onSources: (sources) => {
           chatHistory.value[aiMessageIndex].sources = sources
@@ -290,6 +550,8 @@ const submitQuery = async () => {
         }
       }
     )
+    // 流结束后刷新会话列表（标题可能自动改写了）
+    await fetchSessions()
   } catch (error: any) {
     if (!chatHistory.value[aiMessageIndex].content) {
       chatHistory.value[aiMessageIndex].content = `❌ 网络异常: 与局域网 RAG 服务器连接超时`
@@ -302,24 +564,12 @@ const submitQuery = async () => {
 
 const scrollToBottom = async () => {
   await nextTick()
-  if (scrollbarRef.value) {
-    scrollbarRef.value.setScrollTop(999999)
-  }
+  if (scrollbarRef.value) scrollbarRef.value.setScrollTop(999999)
 }
 
 const renderMarkdown = (text: string) => {
   if (!text) return '<span class="cursor-pulse">|</span>'
   return marked(text)
-}
-
-/**
- * 清空当前会话上下文
- * 注：会话持久化（多轮记忆）属于 P1-2 工作，当前仅清空本地 UI 状态。
- */
-const clearSession = async () => {
-  sessionId.value = ''
-  chatHistory.value = []
-  ElMessage.success('当前上下文历史已安全销毁释放')
 }
 
 const formatSize = (bytes: number) => {
@@ -330,18 +580,16 @@ const formatSize = (bytes: number) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
 }
 
-const formatScore = (score: number) => {
-  return `${(score * 100).toFixed(1)}%`
-}
+const formatScore = (score: number) => `${(score * 100).toFixed(1)}%`
 
-onMounted(() => {
-  fetchKnowledgeSources()
+onMounted(async () => {
+  await Promise.all([fetchKnowledgeSources(), fetchSessions()])
 })
 </script>
 
 <style scoped>
 /* ==========================================================================
-   📐 布局层
+   📐 布局
    ========================================================================== */
 .dashboard-chat-container {
   display: flex;
@@ -360,46 +608,189 @@ onMounted(() => {
   transition: all 0.3s ease;
 }
 
-.sidebar-header {
-  padding: 20px;
+.sidebar-section {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sidebar-session {
+  max-height: 42%;
   border-bottom: 1px solid var(--rag-border-sub);
 }
 
+.sidebar-source {
+  flex: 1;
+  min-height: 0;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 18px 10px;
+}
+
 .brand-icon {
-  font-size: 22px;
+  font-size: 18px;
   color: var(--rag-primary-brand);
 }
 
 .brand-title {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 600;
+  color: var(--rag-text-title);
+  letter-spacing: 0.2px;
+}
+
+.section-meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--rag-text-sub);
+  background-color: var(--rag-bg-container);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
+.new-chat-btn {
+  margin-left: auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 8px;
+  background: var(--rag-card-active) !important;
+  color: var(--rag-primary-brand) !important;
+}
+
+.new-chat-btn:hover {
+  background: var(--rag-primary-brand) !important;
+  color: #fff !important;
+}
+
+.session-list-wrapper {
+  flex: 1;
+  padding: 4px 12px 12px;
+  overflow: hidden;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--rag-text-main);
+  transition: all 0.2s ease;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+}
+
+.session-item:hover {
+  background-color: var(--rag-card-hover);
+}
+
+.session-item.is-active {
+  background-color: var(--rag-card-active);
+  border-color: var(--rag-card-active-border);
+  color: var(--rag-text-title);
+  font-weight: 600;
+}
+
+.session-icon {
+  font-size: 14px;
+  color: var(--rag-info);
+  flex-shrink: 0;
+}
+
+.session-title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.session-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transform: translateX(4px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.session-item:hover .session-actions,
+.session-item.is-active .session-actions {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.session-action-btn {
+  font-size: 13px;
+  color: var(--rag-text-sub);
+  padding: 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  user-select: none;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-family: inherit;
+}
+
+.session-action-btn:focus-visible {
+  outline: 2px solid var(--rag-primary-brand);
+  outline-offset: 1px;
+}
+
+.session-action-btn:hover {
+  background-color: var(--rag-bg-container);
   color: var(--rag-text-title);
 }
 
+.session-action-delete:hover {
+  color: var(--el-color-danger) !important;
+  background-color: var(--rag-danger-bg) !important;
+}
+
+.session-action-btn.is-busy {
+  color: var(--rag-primary-brand) !important;
+  cursor: wait;
+}
+
+.session-action-btn.is-busy svg,
+.session-action-btn.is-busy .el-icon {
+  animation: spin 0.8s linear infinite;
+}
+
 .sidebar-hint {
-  padding: 12px 20px;
+  padding: 4px 18px 10px;
   font-size: 12px;
   color: var(--rag-text-sub);
   line-height: 1.6;
-  background-color: var(--rag-bg-container);
-  transition: background-color 0.3s ease;
 }
 
 .source-list-wrapper {
   flex: 1;
-  padding: 14px;
+  padding: 4px 12px 12px;
   overflow: hidden;
 }
 
 .source-item-card {
-  padding: 12px;
+  padding: 10px 12px;
   background: var(--rag-card-item);
   border: 1px solid var(--rag-border-color);
   border-radius: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   cursor: pointer;
   transition: all 0.2s ease;
 }
@@ -417,7 +808,7 @@ onMounted(() => {
 .item-meta {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: 10px;
 }
 
 :deep(.el-checkbox__inner) {
@@ -432,8 +823,9 @@ onMounted(() => {
 .file-info {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   overflow: hidden;
+  min-width: 0;
 }
 
 .file-name {
@@ -448,7 +840,7 @@ onMounted(() => {
 .file-tags {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .file-size {
@@ -456,23 +848,9 @@ onMounted(() => {
   color: var(--rag-text-sub);
 }
 
-.sidebar-footer {
-  padding: 16px;
-  border-top: 1px solid var(--rag-border-sub);
-}
-
-.action-btn {
-  width: 100%;
-  border-radius: 6px;
-  background: var(--rag-card-item) !important;
-  border-color: var(--rag-border-color) !important;
-  color: var(--rag-text-main) !important;
-}
-.action-btn:hover {
-  border-color: var(--rag-primary-brand) !important;
-  color: var(--rag-primary-brand) !important;
-}
-
+/* ==========================================================================
+   🗨️ 聊天区
+   ========================================================================== */
 .chat-main-terminal {
   flex: 1;
   display: flex;
@@ -571,9 +949,7 @@ onMounted(() => {
   line-height: 1.5;
 }
 
-/* ==========================================================================
-   💬 消息气泡
-   ========================================================================== */
+/* 消息气泡 */
 .message-row {
   display: flex;
   gap: 16px;
@@ -628,11 +1004,9 @@ onMounted(() => {
 .bubble-content :deep(p) {
   margin: 0 0 10px 0;
 }
-
 .bubble-content :deep(p:last-child) {
   margin-bottom: 0;
 }
-
 .bubble-content :deep(code) {
   background-color: var(--rag-bg-container);
   padding: 2px 6px;
@@ -640,9 +1014,7 @@ onMounted(() => {
   font-family: monospace;
   font-size: 13px;
   color: #dc2626;
-  transition: background-color 0.3s ease;
 }
-
 .bubble-content :deep(pre) {
   background-color: var(--rag-bg-container);
   padding: 12px 14px;
@@ -651,24 +1023,20 @@ onMounted(() => {
   margin: 10px 0;
   border: 1px solid var(--rag-border-sub);
 }
-
 .bubble-content :deep(pre code) {
   background: transparent;
   padding: 0;
   color: var(--rag-text-main);
   font-size: 13px;
 }
-
 .bubble-content :deep(ul),
 .bubble-content :deep(ol) {
   margin: 6px 0 10px;
   padding-left: 22px;
 }
-
 .bubble-content :deep(li) {
   margin: 4px 0;
 }
-
 .bubble-content :deep(h1),
 .bubble-content :deep(h2),
 .bubble-content :deep(h3) {
@@ -676,7 +1044,6 @@ onMounted(() => {
   font-weight: 600;
   color: var(--rag-text-title);
 }
-
 .bubble-content :deep(h1) {
   font-size: 20px;
 }
@@ -686,7 +1053,6 @@ onMounted(() => {
 .bubble-content :deep(h3) {
   font-size: 15px;
 }
-
 .bubble-content :deep(blockquote) {
   margin: 10px 0;
   padding: 8px 14px;
@@ -695,21 +1061,18 @@ onMounted(() => {
   border-radius: 0 6px 6px 0;
   color: var(--rag-text-sub);
 }
-
 .bubble-content :deep(table) {
   border-collapse: collapse;
   margin: 10px 0;
   font-size: 13px;
   width: 100%;
 }
-
 .bubble-content :deep(th),
 .bubble-content :deep(td) {
   border: 1px solid var(--rag-border-sub);
   padding: 8px 12px;
   text-align: left;
 }
-
 .bubble-content :deep(th) {
   background-color: var(--rag-bg-container);
   font-weight: 600;
@@ -758,7 +1121,6 @@ onMounted(() => {
 
 .citations-count {
   font-size: 12px;
-  color: var(--rag-text-sub);
   background-color: var(--rag-info-bg);
   color: var(--rag-info);
   padding: 1px 8px;
@@ -778,12 +1140,11 @@ onMounted(() => {
 }
 
 .citations-list {
-  padding: 4px 14px 14px;
+  border-top: 1px solid var(--rag-border-sub);
+  padding: 12px 14px 14px;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  border-top: 1px solid var(--rag-border-sub);
-  padding-top: 12px;
 }
 
 .citation-card {
@@ -800,6 +1161,7 @@ onMounted(() => {
   border-color: var(--rag-primary-brand);
   background-color: var(--rag-card-hover);
   transform: translateX(2px);
+  box-shadow: var(--rag-shadow-sm);
 }
 
 .citation-head {
@@ -882,15 +1244,16 @@ onMounted(() => {
 
 .meta-tip {
   font-style: italic;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
-/* 折叠过渡 */
 .citations-fade-enter-active,
 .citations-fade-leave-active {
   transition: opacity 0.25s ease, max-height 0.3s ease, padding 0.3s ease;
   overflow: hidden;
 }
-
 .citations-fade-enter-from,
 .citations-fade-leave-to {
   opacity: 0;
@@ -898,11 +1261,84 @@ onMounted(() => {
   padding-top: 0;
   padding-bottom: 0;
 }
-
 .citations-fade-enter-to,
 .citations-fade-leave-from {
   opacity: 1;
   max-height: 1200px;
+}
+
+/* ==========================================================================
+   🌟【P1-2】引用原文预览弹窗
+   ========================================================================== */
+.preview-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.preview-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--rag-text-sub);
+  flex-wrap: wrap;
+}
+
+.preview-filename {
+  font-weight: 600;
+  color: var(--rag-text-title);
+  font-size: 13px;
+}
+
+.preview-divider {
+  opacity: 0.5;
+}
+
+.preview-chunk {
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+}
+
+.preview-score {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--rag-success);
+  background-color: var(--rag-success-bg);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 11px;
+}
+
+.preview-score .score-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--rag-success);
+}
+
+.preview-body {
+  font-size: 14px;
+  line-height: 1.85;
+  color: var(--rag-text-main);
+  background-color: var(--rag-bg-container);
+  border: 1px solid var(--rag-border-sub);
+  border-left: 3px solid var(--rag-primary-brand);
+  border-radius: 0 10px 10px 0;
+  padding: 16px 18px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.preview-tip {
+  font-size: 12px;
+  color: var(--rag-text-sub);
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* ==========================================================================
@@ -1004,6 +1440,15 @@ onMounted(() => {
   }
   50% {
     opacity: 1;
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 </style>
