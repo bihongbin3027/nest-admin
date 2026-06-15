@@ -981,6 +981,45 @@ export class RagService {
   // 🔥【P1-2】流式问答（接入会话持久化 + 多轮上下文）
   // ============================================================================
 
+  /**
+   * Qdrant 相似度检索助手
+   * @param question  用户问题
+   * @param fileIds   限定检索的文件 id 列表。
+   *                  - null = 全库检索（不应用 fileId 过滤）—— P1-6 新增
+   *                  - []   = 不检索（外部应跳过调用）
+   *                  - [n1, n2, ...] = 仅检索这些文件下的 chunk
+   */
+  private async vectorSearch(
+    question: string,
+    fileIds: number[] | null,
+  ): Promise<{ doc: Document; score: number }[]> {
+    try {
+      const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
+        url: this.qdrantUrl,
+        collectionName: this.collectionName,
+      })
+      // ⚠️ Qdrant 的 `match.any` 只对 array 字段有效，对 scalar int 字段会返回 0 命中。
+      // 单值用 `match: { value: X }`；多值用 `should` 拼多个 value 子句（语义等同"或"）。
+      let filter: any = undefined
+      if (Array.isArray(fileIds) && fileIds.length > 0) {
+        filter =
+          fileIds.length === 1
+            ? { must: [{ key: 'metadata.fileId', match: { value: fileIds[0] } }] }
+            : {
+                should: fileIds.map((id) => ({
+                  key: 'metadata.fileId',
+                  match: { value: id },
+                })),
+              }
+      }
+      const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
+      return raw.map(([doc, score]) => ({ doc, score }))
+    } catch (vErr) {
+      this.logger.error('[Qdrant 相似度检索失败]', vErr as any)
+      return []
+    }
+  }
+
   async executeDualTrackQuery(
     question: string,
     sessionId: string | number | null,
@@ -1016,31 +1055,12 @@ export class RagService {
       if (sources && sources.length > 0) {
         // 【P1-4】树形勾选：先把"文件夹 id + 文件 id"混合列表展开为纯文件 id
         const effectiveFileIds = await this.expandAssetIdsToFileIds(sources)
-        if (effectiveFileIds.length === 0) {
-          relevantDocs = []
-        } else {
-          try {
-            const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
-              url: this.qdrantUrl,
-              collectionName: this.collectionName,
-            })
-            // ⚠️ Qdrant 的 `match.any` 只对 array 字段有效，对 scalar int 字段会返回 0 命中。
-            // 单值用 `match: { value: X }`；多值用 `should` 拼多个 value 子句（语义等同"或"）。
-            const filter: any =
-              effectiveFileIds.length === 1
-                ? { must: [{ key: 'metadata.fileId', match: { value: effectiveFileIds[0] } }] }
-                : {
-                    should: effectiveFileIds.map((id) => ({
-                      key: 'metadata.fileId',
-                      match: { value: id },
-                    })),
-                  }
-            const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
-            relevantDocs = raw.map(([doc, score]) => ({ doc, score }))
-          } catch (vErr) {
-            relevantDocs = []
-          }
+        if (effectiveFileIds.length > 0) {
+          relevantDocs = await this.vectorSearch(question, effectiveFileIds)
         }
+      } else {
+        // 【P1-6】未勾选任何资产：走全库相似度检索（不带 fileId 过滤）
+        relevantDocs = await this.vectorSearch(question, null)
       }
 
       if (relevantDocs.length === 0) {

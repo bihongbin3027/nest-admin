@@ -72,12 +72,14 @@
         <div class="section-header">
           <el-icon class="brand-icon"><Collection /></el-icon>
           <span class="brand-title">知识源</span>
-          <span class="section-meta" v-if="selectedSources.length > 0">
+          <span class="section-meta section-meta-all" v-if="selectedSources.length === 0">
+            <el-icon><Aim /></el-icon> 全库检索
+          </span>
+          <span class="section-meta" v-else>
             {{ selectedSources.length }} 项 · 覆盖 {{ effectiveFileCount }} 文件
           </span>
-          <span class="section-meta" v-else>{{ totalFileCount }} 个文件</span>
         </div>
-        <div class="sidebar-hint">勾选文件夹 = 选中其下所有文件；可单文件精准勾选。</div>
+        <div class="sidebar-hint">未勾选 = 全库检索；勾选文件夹 = 选中其下所有文件；可单文件精准勾选。</div>
 
         <!-- 搜索框 + 工具按钮 -->
         <div class="source-toolbar">
@@ -373,7 +375,6 @@
       </div>
       <template #footer>
         <el-button @click="previewVisible = false">关闭</el-button>
-        <el-button type="primary" @click="goToRagManagement">前往知识库</el-button>
       </template>
     </el-dialog>
   </div>
@@ -382,7 +383,6 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { useRouter } from 'vue-router'
 import {
   ChatLineRound,
   ChatLineSquare,
@@ -409,7 +409,8 @@ import {
   CircleClose,
   Fold,
   Expand,
-  Refresh
+  Refresh,
+  Aim
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import {
@@ -446,8 +447,6 @@ interface ChatMessage {
   sourcesExpanded?: boolean
 }
 
-const router = useRouter()
-
 // ============================================================================
 // 知识源（树形 + 搜索 + 勾选）
 // ============================================================================
@@ -459,25 +458,6 @@ const sourceTreeRef = ref<any>()
 // 默认展开前 3 个根节点（夹层深时也只展开第一层，避免 UI 撑爆）
 const defaultExpandedKeys = ref<number[]>([])
 const treeAllExpanded = ref(false)
-
-/**
- * 全树文件总数（用于展示「X 个文件」）
- * BFS 走整棵树，只数叶子（isFolder === 0）的数量
- */
-const totalFileCount = computed(() => {
-  let count = 0
-  const walk = (nodes: SourceTreeNode[]) => {
-    for (const n of nodes) {
-      if (n.isFolder === 1) {
-        if (n.children && n.children.length > 0) walk(n.children)
-      } else {
-        count++
-      }
-    }
-  }
-  walk(treeData.value)
-  return count
-})
 
 /**
  * 勾选项展开后的"有效文件数"（仅叶子数）
@@ -793,13 +773,6 @@ const openCitationPreview = async (src: CitationItem) => {
   }
 }
 
-const goToRagManagement = () => {
-  previewVisible.value = false
-  router.push('/rag-dir/rag').catch(() => {
-    /* 已在 RAG 页时静默 */
-  })
-}
-
 const quickQuestion = (text: string) => {
   inputQuery.value = text
 }
@@ -991,6 +964,19 @@ onMounted(async () => {
   padding: 2px 8px;
   border-radius: 999px;
   font-variant-numeric: tabular-nums;
+}
+
+.section-meta.section-meta-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--rag-primary-brand);
+  background-color: var(--rag-info-bg);
+  font-weight: 600;
+}
+
+.section-meta.section-meta-all .el-icon {
+  font-size: 12px;
 }
 
 .new-chat-btn {
