@@ -67,45 +67,96 @@
         </div>
       </div>
 
-      <!-- 知识源区 -->
+      <!-- 知识源区（树形勾选 + 顶部搜索） -->
       <div class="sidebar-section sidebar-source">
         <div class="section-header">
           <el-icon class="brand-icon"><Collection /></el-icon>
           <span class="brand-title">知识源</span>
-          <span class="section-meta">{{ selectedSources.length }} / {{ sourceFiles.length }}</span>
+          <span class="section-meta" v-if="selectedSources.length > 0">
+            {{ selectedSources.length }} 项 · 覆盖 {{ effectiveFileCount }} 文件
+          </span>
+          <span class="section-meta" v-else>{{ totalFileCount }} 个文件</span>
         </div>
-        <div class="sidebar-hint">勾选下方的企业语料，AI 将限定在选定资产范围内执行精准双轨检索。</div>
+        <div class="sidebar-hint">勾选文件夹 = 选中其下所有文件；可单文件精准勾选。</div>
+
+        <!-- 搜索框 + 工具按钮 -->
+        <div class="source-toolbar">
+          <el-input
+            v-model="sourceFilterText"
+            placeholder="搜索资产名称..."
+            clearable
+            size="small"
+            class="source-search-input"
+          >
+            <template #prefix>
+              <el-icon><Search /></el-icon>
+            </template>
+          </el-input>
+          <el-tooltip content="刷新资产" placement="top" :show-after="300">
+            <el-button size="small" text :loading="refreshing" @click="refreshTree" class="source-tool-btn">
+              <el-icon :class="{ 'is-spinning': refreshing }"><Refresh /></el-icon>
+            </el-button>
+          </el-tooltip>
+          <el-tooltip :content="treeAllExpanded ? '折叠全部' : '展开全部'" placement="top" :show-after="300">
+            <el-button size="small" text @click="toggleExpandAll" class="source-tool-btn">
+              <el-icon><component :is="treeAllExpanded ? Fold : Expand" /></el-icon>
+            </el-button>
+          </el-tooltip>
+          <el-tooltip content="清空选择" placement="top" :show-after="300">
+            <el-button
+              size="small"
+              text
+              :disabled="selectedSources.length === 0"
+              @click="clearSelection"
+              class="source-tool-btn"
+            >
+              <el-icon><CircleClose /></el-icon>
+            </el-button>
+          </el-tooltip>
+        </div>
+
         <div class="source-list-wrapper" v-loading="sourcesLoading">
           <el-scrollbar>
-            <div
-              v-for="item in sourceFiles"
-              :key="item.id"
-              class="source-item-card"
-              :class="{ 'is-active': selectedSources.includes(item.id) }"
-              @click="toggleSource(item.id)"
+            <el-tree
+              v-if="treeData.length > 0"
+              ref="sourceTreeRef"
+              :data="treeData"
+              node-key="id"
+              :props="{ label: 'fileName', children: 'children' }"
+              :filter-node-method="filterTreeNode"
+              :default-expanded-keys="defaultExpandedKeys"
+              show-checkbox
+              empty-text="暂无语料，请让管理员在网盘中上传"
+              class="source-tree"
+              @check="onTreeCheck"
             >
-              <div class="item-meta">
-                <el-checkbox
-                  :model-value="selectedSources.includes(item.id)"
-                  @change="toggleSource(item.id)"
-                  @click.stop
-                />
-                <div class="file-info">
-                  <span class="file-name" :title="item.fileName">{{ item.fileName }}</span>
-                  <div class="file-tags">
-                    <el-tag size="small" :type="item.ragTrack === 'sql' ? 'success' : 'primary'" effect="plain">
-                      {{ item.ragTrack === 'sql' ? '结构化报表' : '长文本向量' }}
+              <template #default="{ data }">
+                <div class="tree-node-row" :class="{ 'is-folder': data.isFolder === 1 }">
+                  <el-icon v-if="data.isFolder === 1" class="tree-node-icon tree-icon-folder">
+                    <Folder />
+                  </el-icon>
+                  <el-icon v-else-if="data.ragTrack === 'sql'" class="tree-node-icon tree-icon-sql">
+                    <Grid />
+                  </el-icon>
+                  <el-icon v-else class="tree-node-icon tree-icon-vector">
+                    <Document />
+                  </el-icon>
+                  <span class="tree-node-name" :title="data.fileName">{{ data.fileName }}</span>
+                  <template v-if="data.isFolder !== 1">
+                    <el-tag
+                      size="small"
+                      :type="data.ragTrack === 'sql' ? 'success' : 'primary'"
+                      effect="plain"
+                      class="tree-node-tag"
+                    >
+                      {{ data.ragTrack === 'sql' ? 'SQL' : 'VEC' }}
                     </el-tag>
-                    <span class="file-size">{{ formatSize(item.size) }}</span>
-                  </div>
+                    <span class="tree-node-size">{{ formatSize(data.size) }}</span>
+                  </template>
                 </div>
-              </div>
-            </div>
-            <el-empty
-              v-if="!sourcesLoading && sourceFiles.length === 0"
-              description="暂无语料，请让管理员在网盘中上传"
-              :image-size="60"
-            />
+              </template>
+            </el-tree>
+            <el-empty v-else-if="!sourcesLoading" description="暂无语料，请让管理员在网盘中上传" :image-size="60" />
           </el-scrollbar>
         </div>
       </div>
@@ -329,7 +380,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import {
@@ -352,7 +403,13 @@ import {
   Paperclip,
   ArrowDown,
   View,
-  InfoFilled
+  InfoFilled,
+  Search,
+  Folder,
+  CircleClose,
+  Fold,
+  Expand,
+  Refresh
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import {
@@ -368,12 +425,18 @@ import {
   type RagSessionItem
 } from '@/api/rag'
 
-interface SourceFile {
+/**
+ * 【P1-4】el-tree 节点结构
+ * - isFolder = 1：目录节点，可能含 children
+ * - isFolder = 0：文件叶子节点
+ */
+interface SourceTreeNode {
   id: number
   fileName: string
-  size: number
-  ragTrack: 'vector' | 'sql' | null
   isFolder: 0 | 1
+  ragTrack: 'vector' | 'sql' | null
+  size: number
+  children?: SourceTreeNode[]
 }
 
 interface ChatMessage {
@@ -385,10 +448,195 @@ interface ChatMessage {
 
 const router = useRouter()
 
-// 知识源
-const sourceFiles = ref<SourceFile[]>([])
+// ============================================================================
+// 知识源（树形 + 搜索 + 勾选）
+// ============================================================================
+const treeData = ref<SourceTreeNode[]>([])
 const selectedSources = ref<number[]>([])
 const sourcesLoading = ref(false)
+const sourceFilterText = ref('')
+const sourceTreeRef = ref<any>()
+// 默认展开前 3 个根节点（夹层深时也只展开第一层，避免 UI 撑爆）
+const defaultExpandedKeys = ref<number[]>([])
+const treeAllExpanded = ref(false)
+
+/**
+ * 全树文件总数（用于展示「X 个文件」）
+ * BFS 走整棵树，只数叶子（isFolder === 0）的数量
+ */
+const totalFileCount = computed(() => {
+  let count = 0
+  const walk = (nodes: SourceTreeNode[]) => {
+    for (const n of nodes) {
+      if (n.isFolder === 1) {
+        if (n.children && n.children.length > 0) walk(n.children)
+      } else {
+        count++
+      }
+    }
+  }
+  walk(treeData.value)
+  return count
+})
+
+/**
+ * 勾选项展开后的"有效文件数"（仅叶子数）
+ * - 勾选文件夹 → 算入其下所有叶子文件
+ * - 勾选单文件 → 算 1
+ * - 注：el-tree 的 getCheckedKeys 在父节点被勾选时也会带回子节点 key，
+ *       所以本质上是"统计 selectedSources 里命中 fileIdSet 的数量"
+ */
+const fileIdSet = computed(() => {
+  const set = new Set<number>()
+  const walk = (nodes: SourceTreeNode[]) => {
+    for (const n of nodes) {
+      if (n.isFolder === 1) {
+        if (n.children && n.children.length > 0) walk(n.children)
+      } else {
+        set.add(n.id)
+      }
+    }
+  }
+  walk(treeData.value)
+  return set
+})
+
+const effectiveFileCount = computed(() => {
+  let n = 0
+  for (const id of selectedSources.value) if (fileIdSet.value.has(id)) n++
+  return n
+})
+
+/**
+ * 递归加载整棵知识库树（一次性 eagar load）
+ * 选 eager 而非 lazy：用户痛点是"层级深 / 文件多导致列表爆掉"，
+ * eagar load 让数据形态变"树"（默认只看根），UI 不再爆。
+ * 文件数 ≤ 1000 时一次性拉完是 O(单次请求+内存) 成本，可接受。
+ */
+const fetchKnowledgeSources = async () => {
+  sourcesLoading.value = true
+  try {
+    const buildSubtree = async (parentId: number): Promise<SourceTreeNode[]> => {
+      const res: any = await getKnowledgeFileList(parentId)
+      const items: RagAssetItem[] = (res?.data ?? res ?? []) as RagAssetItem[]
+      const result: SourceTreeNode[] = []
+      for (const item of items) {
+        const node: SourceTreeNode = {
+          id: item.id,
+          fileName: item.fileName,
+          isFolder: item.isFolder,
+          ragTrack: item.ragTrack,
+          size: item.size
+        }
+        if (item.isFolder === 1) {
+          node.children = await buildSubtree(item.id)
+        }
+        result.push(node)
+      }
+      return result
+    }
+    treeData.value = await buildSubtree(0)
+    // 默认展开前 3 个根节点
+    defaultExpandedKeys.value = treeData.value
+      .filter((n) => n.isFolder === 1)
+      .slice(0, 3)
+      .map((n) => n.id)
+    treeAllExpanded.value = false
+  } catch (err) {
+    console.error('知识库拉取失败，请检查服务端是否启动', err)
+  } finally {
+    sourcesLoading.value = false
+  }
+}
+
+/**
+ * el-tree 的过滤节点回调：输入文本包含在 fileName 中则显示
+ * - 文件夹命中 → 显示其下命中节点（el-tree 自动保留子树）
+ * - 未命中 → 隐藏
+ */
+const filterTreeNode = (value: string, data: SourceTreeNode): boolean => {
+  if (!value) return true
+  return data.fileName.toLowerCase().includes(value.toLowerCase())
+}
+
+watch(sourceFilterText, (val) => {
+  sourceTreeRef.value?.filter(val)
+})
+
+const onTreeCheck = () => {
+  // false = 只取完全勾选（含子全选时父也会在结果里）
+  const checked = (sourceTreeRef.value?.getCheckedKeys(false) || []) as number[]
+  selectedSources.value = checked
+}
+
+const clearSelection = () => {
+  sourceTreeRef.value?.setCheckedKeys([])
+  selectedSources.value = []
+}
+
+/**
+ * 展开 / 折叠全部
+ *
+ * 注意：Element Plus 2.4.0 的 el-tree 还没有 setExpandedKeys（要 2.5+ 才有），
+ * 直接走 store.nodesMap[key].expand() / collapse() 是最稳的。
+ * store 是 script setup return 的 ref，已被自动解包，直接拿 .nodesMap 即可。
+ */
+const toggleExpandAll = () => {
+  if (!sourceTreeRef.value) return
+  const folderIds: number[] = []
+  const walk = (nodes: SourceTreeNode[]) => {
+    for (const n of nodes) {
+      if (n.isFolder === 1) {
+        folderIds.push(n.id)
+        if (n.children) walk(n.children)
+      }
+    }
+  }
+  walk(treeData.value)
+
+  const store: any = sourceTreeRef.value.store
+  if (!store?.nodesMap) {
+    console.warn('[toggleExpandAll] el-tree store 不可用，放弃本次切换')
+    return
+  }
+
+  const shouldExpand = !treeAllExpanded.value
+  for (const id of folderIds) {
+    const node = store.nodesMap[id]
+    if (!node) continue
+    if (shouldExpand) node.expand()
+    else node.collapse()
+  }
+  treeAllExpanded.value = shouldExpand
+}
+
+/**
+ * 刷新资产树：重拉一次 buildSubtree(0)，重建 treeData。
+ * - 保留用户已选中的"文件 id"（folder id 不一定能恢复，结构可能变了）；
+ * - 保留展开 / 折叠状态通过 defaultExpandedKeys 重新应用；
+ * - 搜索框的过滤词保留（el-tree 自己维持 hidden 状态）。
+ */
+const refreshing = ref(false)
+const refreshTree = async () => {
+  if (refreshing.value) return
+  refreshing.value = true
+  // 先把当前选中的叶子文件 id 记下来（folder id 在重建后可能失效）
+  const prevCheckedKeys = (sourceTreeRef.value?.getCheckedKeys(false) || []) as number[]
+  const prevCheckedFileIds = prevCheckedKeys.filter((id) => fileIdSet.value.has(id))
+  try {
+    await fetchKnowledgeSources()
+    await nextTick()
+    // 把仍存在的文件 id 重新勾上
+    if (sourceTreeRef.value?.setCheckedKeys) {
+      sourceTreeRef.value.setCheckedKeys(prevCheckedFileIds, false)
+    }
+    selectedSources.value = prevCheckedFileIds
+  } catch (err) {
+    console.error('刷新资产树失败', err)
+  } finally {
+    refreshing.value = false
+  }
+}
 
 // 会话
 const sessions = ref<RagSessionItem[]>([])
@@ -412,27 +660,6 @@ const previewTableData = ref<{
   columns: string[]
   rows: Array<Record<string, string | number | null>>
 } | null>(null)
-
-const fetchKnowledgeSources = async () => {
-  sourcesLoading.value = true
-  try {
-    const res: any = await getKnowledgeFileList(0)
-    const list: RagAssetItem[] = (res?.data ?? res ?? []) as RagAssetItem[]
-    sourceFiles.value = list
-      .filter((i) => !i.isFolder)
-      .map((i) => ({
-        id: i.id,
-        fileName: i.fileName,
-        size: i.size,
-        ragTrack: i.ragTrack,
-        isFolder: i.isFolder
-      }))
-  } catch (err) {
-    console.error('知识库拉取失败，请检查服务端是否启动', err)
-  } finally {
-    sourcesLoading.value = false
-  }
-}
 
 const fetchSessions = async () => {
   sessionsLoading.value = true
@@ -535,12 +762,6 @@ const confirmDeleteSession = async (s: RagSessionItem) => {
   } finally {
     deletingId.value = null
   }
-}
-
-const toggleSource = (id: number) => {
-  const index = selectedSources.value.indexOf(id)
-  if (index > -1) selectedSources.value.splice(index, 1)
-  else selectedSources.value.push(id)
 }
 
 const toggleCitations = (index: number) => {
@@ -898,73 +1119,176 @@ onMounted(async () => {
   line-height: 1.6;
 }
 
+.source-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px 8px;
+}
+
+.source-search-input {
+  flex: 1;
+}
+
+.source-search-input :deep(.el-input__wrapper) {
+  background-color: var(--rag-card-item);
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px var(--rag-border-sub) inset !important;
+  padding: 2px 8px;
+}
+
+.source-search-input :deep(.el-input__wrapper):hover {
+  box-shadow: 0 0 0 1px var(--rag-primary-brand) inset !important;
+}
+
+.source-search-input :deep(.el-input__inner) {
+  font-size: 12px;
+  color: var(--rag-text-main);
+}
+
+.source-tool-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  margin-left: 0;
+  color: var(--rag-text-sub);
+  background-color: var(--rag-card-item) !important;
+  border: 1px solid var(--rag-border-sub);
+}
+
+.source-tool-btn:hover {
+  color: var(--rag-primary-brand);
+  border-color: var(--rag-primary-brand);
+}
+
+.source-tool-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.source-tool-btn .is-spinning {
+  animation: spin 0.8s linear infinite;
+}
+
 .source-list-wrapper {
   flex: 1;
   padding: 4px 12px 12px;
   overflow: hidden;
 }
 
-.source-item-card {
-  padding: 10px 12px;
-  background: var(--rag-card-item);
-  border: 1px solid var(--rag-border-color);
-  border-radius: 8px;
-  margin-bottom: 8px;
-  cursor: pointer;
-  transition: all 0.2s ease;
+/* ==========================================================================
+   🌲【P1-4】知识源 el-tree 自定义样式
+   ========================================================================== */
+.source-tree {
+  background: transparent;
+  --el-color-primary: var(--rag-primary-brand);
 }
 
-.source-item-card:hover {
-  border-color: var(--rag-primary-brand);
+.source-tree :deep(.el-tree-node__content) {
+  height: 32px;
+  border-radius: 6px;
+  margin: 1px 0;
+  transition: background-color 0.18s ease;
+}
+
+.source-tree :deep(.el-tree-node__content:hover) {
   background-color: var(--rag-card-hover);
 }
 
-.source-item-card.is-active {
-  border-color: var(--rag-card-active-border);
-  background-color: var(--rag-card-active);
+.source-tree :deep(.el-tree-node.is-current > .el-tree-node__content) {
+  background-color: var(--rag-card-active) !important;
 }
 
-.item-meta {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
+/* 复选框颜色统一主题色 */
+.source-tree :deep(.el-checkbox__inner) {
+  background-color: var(--rag-card-item);
+  border-color: var(--rag-border-color);
+}
+.source-tree :deep(.el-checkbox__input.is-checked .el-checkbox__inner) {
+  background-color: var(--rag-primary-brand);
+  border-color: var(--rag-primary-brand);
+}
+.source-tree :deep(.el-checkbox__input.is-indeterminate .el-checkbox__inner) {
+  background-color: var(--rag-primary-brand);
+  border-color: var(--rag-primary-brand);
 }
 
-:deep(.el-checkbox__inner) {
-  background-color: var(--rag-card-item) !important;
-  border-color: var(--rag-border-color) !important;
+/* 缩进导轨虚化，文件夹层级不抢眼 */
+.source-tree :deep(.el-tree-node__expand-icon) {
+  color: var(--rag-text-sub);
+  font-size: 12px;
 }
-:deep(.el-checkbox__input.is-checked .el-checkbox__inner) {
-  background-color: var(--rag-primary-brand) !important;
-  border-color: transparent !important;
-}
-
-.file-info {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  overflow: hidden;
-  min-width: 0;
+.source-tree :deep(.el-tree-node__expand-icon.is-leaf) {
+  color: transparent;
 }
 
-.file-name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--rag-text-main);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.file-tags {
+/* 节点行布局：图标 + 名称 + tag + size */
+.tree-node-row {
   display: flex;
   align-items: center;
   gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding-right: 8px;
+  font-size: 13px;
+  line-height: 1.2;
 }
 
-.file-size {
-  font-size: 11px;
+.tree-node-row.is-folder {
+  font-weight: 600;
+  color: var(--rag-text-title);
+}
+
+.tree-node-icon {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+
+.tree-icon-folder {
+  color: var(--el-color-warning, #e6a23c);
+}
+
+.tree-icon-sql {
+  color: var(--el-color-success, #67c23a);
+}
+
+.tree-icon-vector {
+  color: var(--rag-info, #909399);
+}
+
+.tree-node-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  color: inherit;
+}
+
+.tree-node-tag {
+  flex-shrink: 0;
+  font-size: 10px !important;
+  height: 18px !important;
+  padding: 0 5px !important;
+  line-height: 16px !important;
+  border-radius: 3px !important;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.tree-node-size {
+  flex-shrink: 0;
+  font-size: 10px;
   color: var(--rag-text-sub);
+  font-variant-numeric: tabular-nums;
+  min-width: 38px;
+  text-align: right;
+}
+
+/* 滚动条靠内，让树节点有完整边距 */
+.source-list-wrapper :deep(.el-scrollbar__wrap) {
+  overflow-x: hidden;
 }
 
 /* ==========================================================================

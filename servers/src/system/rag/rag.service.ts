@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { InjectRepository } from '@nestjs/typeorm'
-import { Repository } from 'typeorm'
+import { Repository, In } from 'typeorm'
 import { ConfigService } from '@nestjs/config'
 import { Response } from 'express'
 import * as path from 'path'
@@ -158,6 +158,51 @@ export class RagService {
       where: { parentId },
       order: { isFolder: 'DESC', createdAt: 'DESC' },
     })
+  }
+
+  /**
+   * 【P1-4】资产 ID 列表（可能含文件夹 + 文件）→ 纯文件 ID 列表（递归展开文件夹）
+   *
+   * 场景：dashboard 树形选择器允许用户勾选"外层文件夹"代表"该文件夹下所有文件"。
+   * Qdrant 检索只认 metadata.fileId，所以后端在 similaritySearch 前必须把
+   * 混合的"文件 id + 文件夹 id"列表展开成纯文件 id。
+   *
+   * 算法：BFS 一次性查所有直系子节点；目录深度通常 ≤ 3 层，最坏 O(N)。
+   * 防御：visited Set 防止 folder 间循环引用导致死循环。
+   */
+  async expandAssetIdsToFileIds(assetIds: number[]): Promise<number[]> {
+    if (!Array.isArray(assetIds) || assetIds.length === 0) return []
+
+    // 第一步：先分桶（哪些是文件夹，哪些是文件）
+    const items = await this.ragFileRepository.find({
+      where: { id: In(assetIds) },
+      select: ['id', 'isFolder'],
+    })
+    const fileIdSet = new Set<number>()
+    const folderIds: number[] = []
+    for (const item of items) {
+      if (item.isFolder === 1) folderIds.push(item.id)
+      else fileIdSet.add(item.id)
+    }
+    if (folderIds.length === 0) return Array.from(fileIdSet)
+
+    // 第二步：BFS 展开所有文件夹的子孙文件
+    const visited = new Set<number>()
+    const queue: number[] = [...folderIds]
+    while (queue.length > 0) {
+      const currentId = queue.shift()!
+      if (visited.has(currentId)) continue
+      visited.add(currentId)
+      const children = await this.ragFileRepository.find({
+        where: { parentId: currentId },
+        select: ['id', 'isFolder'],
+      })
+      for (const c of children) {
+        if (c.isFolder === 1) queue.push(c.id)
+        else fileIdSet.add(c.id)
+      }
+    }
+    return Array.from(fileIdSet)
   }
 
   async createFolder(fileName: string, parentId: number): Promise<RagFileEntity> {
@@ -893,26 +938,32 @@ export class RagService {
     try {
       let relevantDocs: { doc: Document; score: number }[] = []
       if (sources && sources.length > 0) {
-        try {
-          const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
-            url: this.qdrantUrl,
-            collectionName: this.collectionName,
-          })
-          // ⚠️ Qdrant 的 `match.any` 只对 array 字段有效，对 scalar int 字段会返回 0 命中。
-          // 单值用 `match: { value: X }`；多值用 `should` 拼多个 value 子句（语义等同"或"）。
-          const filter: any =
-            sources.length === 1
-              ? { must: [{ key: 'metadata.fileId', match: { value: sources[0] } }] }
-              : {
-                  should: sources.map((id) => ({
-                    key: 'metadata.fileId',
-                    match: { value: id },
-                  })),
-                }
-          const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
-          relevantDocs = raw.map(([doc, score]) => ({ doc, score }))
-        } catch (vErr) {
+        // 【P1-4】树形勾选：先把"文件夹 id + 文件 id"混合列表展开为纯文件 id
+        const effectiveFileIds = await this.expandAssetIdsToFileIds(sources)
+        if (effectiveFileIds.length === 0) {
           relevantDocs = []
+        } else {
+          try {
+            const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
+              url: this.qdrantUrl,
+              collectionName: this.collectionName,
+            })
+            // ⚠️ Qdrant 的 `match.any` 只对 array 字段有效，对 scalar int 字段会返回 0 命中。
+            // 单值用 `match: { value: X }`；多值用 `should` 拼多个 value 子句（语义等同"或"）。
+            const filter: any =
+              effectiveFileIds.length === 1
+                ? { must: [{ key: 'metadata.fileId', match: { value: effectiveFileIds[0] } }] }
+                : {
+                    should: effectiveFileIds.map((id) => ({
+                      key: 'metadata.fileId',
+                      match: { value: id },
+                    })),
+                  }
+            const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
+            relevantDocs = raw.map(([doc, score]) => ({ doc, score }))
+          } catch (vErr) {
+            relevantDocs = []
+          }
         }
       }
 
