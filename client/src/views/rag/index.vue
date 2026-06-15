@@ -119,7 +119,7 @@
           <el-table-column label="快捷管理操作" width="120" fixed="right" align="center">
             <template #default="{ row }">
               <div class="table-ops">
-                <el-button link type="danger" :disabled="row.isFolder" @click="handleDelete(row)">
+                <el-button link type="danger" :disabled="Boolean(row.isFolder)" @click="handleDelete(row)">
                   <el-icon><Delete /></el-icon> 移除
                 </el-button>
               </div>
