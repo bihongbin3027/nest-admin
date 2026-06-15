@@ -660,8 +660,84 @@ export class RagService {
     this.logger.log(`[SQL轨道] fileId=${fileId} 完成行级向量化：${sheets.length} sheet / ${documents.length} chunk`)
   }
 
+  /**
+   * 删除一个语料资产：必须保证 DB 行 / Qdrant 向量 / 磁盘文件三处一致。
+   *
+   * 顺序：先 Qdrant → 再磁盘 → 最后 DB 行（DB 是真源，删了 DB 后 Qdrant/disk 的孤儿无法回追）
+   * 容忍：Qdrant 与磁盘任一步失败时记录日志但继续往下走（避免一处失败让用户数据卡在"半删除"状态）
+   *
+   * 注意：仅对 isFolder=0 的文件节点生效。目录删除由调用方保证不传目录 id。
+   */
   async deleteFileEntity(id: number): Promise<void> {
+    // 1) 先把记录读出来，拿到 fileUrl（用于定位磁盘文件）
+    const record = await this.ragFileRepository.findOneBy({ id })
+    if (!record) {
+      // 幂等：记录已不存在，直接返回
+      this.logger.log(`[RAG 删除] fileId=${id} 记录已不存在，跳过`)
+      return
+    }
+    if (record.isFolder === 1) {
+      throw new Error('不支持直接删除目录，请逐项删除内部文件')
+    }
+
+    // 2) 删 Qdrant 向量（按 metadata.fileId 过滤）
+    try {
+      await this.deleteQdrantPointsByFileId(id)
+      this.logger.log(`[RAG 删除] Qdrant 清理完成 fileId=${id}`)
+    } catch (err) {
+      this.logger.error(`[RAG 删除] Qdrant 清理失败 fileId=${id}`, err as any)
+      // 不阻断后续清理
+    }
+
+    // 3) 删磁盘文件
+    if (record.fileUrl) {
+      const m = record.fileUrl.match(/\/rag\/([^/?#]+)$/)
+      if (m) {
+        const diskFilename = m[1]
+        const absPath = path.join(RAG_UPLOAD_DIR, diskFilename)
+        try {
+          const fs = await import('fs')
+          await fs.promises.unlink(absPath)
+          this.logger.log(`[RAG 删除] 磁盘文件清理完成 fileId=${id} path=${absPath}`)
+        } catch (err: any) {
+          if (err?.code === 'ENOENT') {
+            // 文件本来就不在了，记一行 info 即可
+            this.logger.log(`[RAG 删除] 磁盘文件已不存在 fileId=${id} path=${absPath}`)
+          } else {
+            this.logger.error(`[RAG 删除] 磁盘清理失败 fileId=${id} path=${absPath}`, err as any)
+          }
+        }
+      } else {
+        this.logger.warn(`[RAG 删除] fileUrl 无法解析 /rag/ 段 fileId=${id} fileUrl=${record.fileUrl}`)
+      }
+    }
+
+    // 4) 最后删 DB 行（DB 是真源）
     await this.ragFileRepository.delete(id)
+    this.logger.log(`[RAG 删除] DB 行清理完成 fileId=${id}`)
+  }
+
+  /**
+   * 按 metadata.fileId 删除 Qdrant 中的所有相关点
+   * 端点：POST {qdrantUrl}/collections/{collectionName}/points/delete
+   */
+  private async deleteQdrantPointsByFileId(fileId: number): Promise<void> {
+    const url = `${this.qdrantUrl.replace(/\/$/, '')}/collections/${this.collectionName}/points/delete`
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filter: { must: [{ key: 'metadata.fileId', match: { value: fileId } }] }
+      })
+    })
+    if (r.ok) return
+    // 404 通常意味着 collection 不存在（首次清理场景），忽略
+    if (r.status === 404) {
+      this.logger.log(`[Qdrant] collection ${this.collectionName} 不存在，跳过向量清理`)
+      return
+    }
+    const txt = await r.text()
+    throw new Error(`Qdrant delete failed: HTTP ${r.status} ${txt.slice(0, 300)}`)
   }
 
   /**

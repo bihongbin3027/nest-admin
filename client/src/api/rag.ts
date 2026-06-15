@@ -179,6 +179,7 @@ export function askQuestionStreamApi(
     method: 'post',
     data,
     responseType: 'text',
+    timeout: 100000,
     onDownloadProgress: (progressEvent) => {
       const rawText = progressEvent.event.target.responseText
       if (!rawText) return

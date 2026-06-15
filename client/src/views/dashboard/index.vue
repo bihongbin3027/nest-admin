@@ -1311,7 +1311,7 @@ onMounted(async () => {
 .chat-inner-flow {
   max-width: 820px;
   margin: 0 auto;
-  padding: 40px 20px 140px;
+  padding: 40px 20px 0;
 }
 
 .welcome-hero {
