@@ -87,15 +87,21 @@ export class PermService {
         `m`.`order_num`
       FROM
         `sys_user_role` `ur`
-        LEFT JOIN `sys_role_menu` `rm` ON `ur`.`role_id` = `rm`.`role_id`
-        LEFT JOIN `sys_menu` `m` ON `rm`.`menu_id` = `m`.`id`
+        INNER JOIN `sys_role_menu` `rm` ON `ur`.`role_id` = `rm`.`role_id`
+        INNER JOIN `sys_menu` `m` ON `rm`.`menu_id` = `m`.`id`
       WHERE
         `ur`.`user_id` = ?
+        AND `m`.`type` IN (1, 2)   -- 排除按钮(type=3)
       GROUP BY
         `m`.`id`
       ORDER BY
         `m`.`order_num` DESC,
-        `m_id` DESC
+        `m_id` ASC
+   *
+   * ⚠️ 重要：必须 INNER JOIN（不能 LEFT JOIN）。
+   *    旧版用 LEFT JOIN + GROUP BY m.id 在 MySQL 下等价于 sys_menu 全表扫描，
+   *    任何已绑定角色（哪怕角色菜单为空）的非超管用户都能看到全部菜单 —— 越权。
+   *    改成 INNER JOIN 后，只有真正授权给当前用户角色的菜单才会出现。
    * @param userId
    * @param userType
    * @returns
@@ -112,9 +118,10 @@ export class PermService {
         .createQueryBuilder()
         .select(['m.id', 'm.parent_id', 'm.name', 'm.type', 'm.code', 'm.order_num'])
         .from('sys_user_role', 'ur')
-        .leftJoin('sys_role_menu', 'rm', 'ur.role_id = rm.role_id')
-        .leftJoin('sys_menu', 'm', 'rm.menu_id = m.id')
+        .innerJoin('sys_role_menu', 'rm', 'ur.role_id = rm.role_id')
+        .innerJoin('sys_menu', 'm', 'rm.menu_id = m.id')
         .where('ur.user_id = :userId', { userId })
+        .andWhere('m.type IN (1, 2)')
         .groupBy('m.id')
         .orderBy('m.order_num', 'DESC')
         .addOrderBy('m.id', 'ASC')

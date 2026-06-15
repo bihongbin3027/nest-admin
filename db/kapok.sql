@@ -296,12 +296,14 @@ CREATE TABLE `sys_user_role`  (
   `user_id` bigint(0) NOT NULL COMMENT '用户id',
   `role_id` bigint(0) NOT NULL COMMENT '角色id',
   PRIMARY KEY (`id`) USING BTREE
-) ENGINE = InnoDB AUTO_INCREMENT = 34 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci ROW_FORMAT = Dynamic;
+) ENGINE = InnoDB AUTO_INCREMENT = 35 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci ROW_FORMAT = Dynamic;
 
 -- ----------------------------
 -- Records of sys_user_role
 -- ----------------------------
-INSERT INTO `sys_user_role` VALUES (33, 2, 2);
+-- test 账号(id=2) 唯一绑定的角色 = 普通用户(id=1)
+-- 历史曾有 (33, 2, 2) 这条"幽灵绑定"指向 sys_role 里不存在的 id=2 角色（MySQL 非严格模式悄悄通过），
+-- 删掉它避免后续角色-菜单数据回填时产生迷惑。
 INSERT INTO `sys_user_role` VALUES (34, 2, 1);
 
 -- ----------------------------
