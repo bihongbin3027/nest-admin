@@ -53,6 +53,13 @@ export interface RagMessageItem {
   createdAt: string
 }
 
+// 【P1-3】SQL 轨道引用的真实行数据
+export interface StructuredRowsResponse {
+  sheetName: string
+  columns: string[]
+  rows: Array<Record<string, string | number | null>>
+}
+
 export interface RAGResponse<T = any> {
   code: number
   message: string
@@ -93,6 +100,15 @@ export function deleteKnowledgeFile(id: number) {
     url: '/rag/file/delete',
     method: 'delete',
     params: { id }
+  })
+}
+
+// 【P1-3】拉取 SQL 引用对应的真实行数据
+export function fetchStructuredRows(data: { fileId: number; sheetName: string; rowIndices: number[] }) {
+  return request<RAGResponse<StructuredRowsResponse>>({
+    url: '/rag/file/structured-rows',
+    method: 'post',
+    data
   })
 }
 

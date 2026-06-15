@@ -19,8 +19,6 @@ import { ConfigService } from '@nestjs/config'
 import { FileInterceptor } from '@nestjs/platform-express'
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger'
 import { Response } from 'express'
-import * as fs from 'fs'
-import * as path from 'path'
 import { diskStorage } from 'multer'
 import { RagService } from './rag.service'
 import { JwtAuthGuard } from '../../common/guards/auth.guard'
@@ -29,35 +27,7 @@ import { UserType } from '../../common/enums/common.enum'
 import { ResultData } from '../../common/utils/result'
 
 import { Keep } from '../../common/decorators/keep.decorator'
-import * as yaml from 'js-yaml'
-
-/**
- * 解析 app.file.location → 绝对路径
- * 必须在 @UseInterceptors 装饰器求值时可用，所以提到模块顶层懒加载。
- * 注意：ConfigService 还没初始化，只能直接读 yml 文件兜底，失败就用 ../upload
- */
-function resolveUploadRoot(): string {
-  try {
-    const env = process.env.NODE_ENV || 'development'
-    const cfgPath = path.join(process.cwd(), 'src', 'config', `${env}.yml`)
-    if (fs.existsSync(cfgPath)) {
-      const doc: any = yaml.load(fs.readFileSync(cfgPath, 'utf8'))
-      const loc = doc?.app?.file?.location || '../upload'
-      return path.isAbsolute(loc) ? loc : path.normalize(path.join(process.cwd(), loc))
-    }
-  } catch {
-    /* fallthrough */
-  }
-  return path.normalize(path.join(process.cwd(), '../upload'))
-}
-
-const RAG_UPLOAD_DIR = path.join(resolveUploadRoot(), 'rag')
-// 启动时确保目录存在
-try {
-  fs.mkdirSync(RAG_UPLOAD_DIR, { recursive: true })
-} catch {
-  /* ignore */
-}
+import { RAG_UPLOAD_DIR } from './rag-upload.util'
 
 @ApiTags('企业级双轨制核心知识库 RAG')
 @ApiBearerAuth()
@@ -146,15 +116,6 @@ export class RagController {
     if (!file) {
       return ResultData.fail(HttpStatus.BAD_REQUEST, '未检测到上传文件流')
     }
-    // 🐛 DEBUG：multer 给的 file.originalname 到底是什么？打印 raw bytes + 各种 decode 尝试
-    const rawBytes = Buffer.from(file.originalname, 'latin1')
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[RAG upload 探针] file.originalname = ${JSON.stringify(file.originalname)} | ` +
-        `rawBytes(${rawBytes.length}B) = ${rawBytes.toString('hex').slice(0, 80)}... | ` +
-        `decode_latin1 = ${rawBytes.toString('utf8')} | ` +
-        `file.filename (磁盘) = ${file.filename}`,
-    )
     // diskStorage 下 file.path 才是真实物理路径；file.filename 是 dest 里磁盘上的文件名（含时间戳前缀）
     // 把物理路径 + 真实访问 URL 一起传给 service，让它写到数据库
     const record = await this.ragService.registerPhysicalFile(
@@ -176,6 +137,28 @@ export class RagController {
     }
     await this.ragService.deleteFileEntity(Number(id))
     return ResultData.ok(null, '该项语料资产已完成安全下线与销毁')
+  }
+
+  // ============================================================================
+  // 📊【P1-3】SQL 轨道引用预览：拉取真实行数据
+  // ============================================================================
+
+  @Post('file/structured-rows')
+  @AllowNoPerm()
+  @ApiOperation({ summary: '拉取 SQL 轨道引用对应的真实行数据（用于预览弹窗渲染迷你表格）' })
+  async getStructuredRows(
+    @Body() dto: { fileId: number; sheetName: string; rowIndices: number[] },
+  ) {
+    const { fileId, sheetName, rowIndices } = dto || ({} as any)
+    if (!fileId || !sheetName || !Array.isArray(rowIndices) || rowIndices.length === 0) {
+      return ResultData.fail(HttpStatus.BAD_REQUEST, '参数缺失：fileId/sheetName/rowIndices')
+    }
+    // 防御：单次最多 100 行，避免有人塞一整个 sheet
+    if (rowIndices.length > 100) {
+      return ResultData.fail(HttpStatus.BAD_REQUEST, '单次最多 100 行')
+    }
+    const result = await this.ragService.getStructuredRows(fileId, sheetName, rowIndices)
+    return ResultData.ok(result)
   }
 
   // ============================================================================

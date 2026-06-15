@@ -19,6 +19,7 @@ import { RagFileEntity, RagTrackEnum, VectorStatusEnum } from './rag-file.entity
 import { RagSessionEntity } from './rag-session.entity'
 import { RagMessageEntity } from './rag-message.entity'
 import { ResultData } from '../../common/utils/result'
+import { RAG_UPLOAD_DIR } from './rag-upload.util'
 
 /**
  * 【P1-2 / P1-3】引用源条目
@@ -375,6 +376,12 @@ export class RagService {
    * 把一行 Excel/CSV 数据序列化成"自然语言友好"的描述。
    * - 例：{ 部门: '研发', 人数: 42, 月份: '2025-03' }
    *   → "部门: 研发; 人数: 42; 月份: 2025-03"
+   *
+   * 关键：ExcelJS 对 Date 单元格返回 `Date` 对象，String() 会输出
+   *   "Sat Mar 15 2025 08:00:00 GMT+0800 (中国标准时间)"，LLM 检索"2025年3月"根本匹配不到。
+   * 这里统一转成 `YYYY-MM-DD`（带时间的转成 `YYYY-MM-DD HH:mm`）。
+   * 对 Excel 数字时间戳（1899-12-30 起的天数）也做识别。
+   *
    * 跳过的内容：
    *   - 空值（null / undefined / 空字符串 / 空白）
    *   - 列名缺失（空标题自动 fallback col_N）
@@ -384,10 +391,64 @@ export class RagService {
     for (const [key, value] of Object.entries(row)) {
       if (value === null || value === undefined) continue
       if (typeof value === 'string' && value.trim() === '') continue
-      // 日期 / 数字 / 字符串统一走 String()，ExcelJS 对 Date 单元格会返回 Date 对象
-      parts.push(`${key}: ${String(value)}`)
+      // ⚠️ Date / Excel 数字时间戳 → YYYY-MM-DD，否则 LLM 检索日期相关问题会全 miss
+      parts.push(`${key}: ${this.stringifyCellValue(value)}`)
     }
     return parts.join('; ')
+  }
+
+  /**
+   * 单个单元格值 → 字符串。
+   * 处理顺序：Date 对象 → 数字（带 Excel 时间戳识别） → 富文本 → 其他
+   */
+  private stringifyCellValue(value: unknown): string {
+    if (value instanceof Date) {
+      return this.formatDate(value)
+    }
+    if (typeof value === 'number' && this.looksLikeExcelDateSerial(value)) {
+      // Excel 时间戳：1900-01-01 起的天数（实际偏移 1899-12-30，含 1900 闰年 bug）
+      const ms = (value - 25569) * 86400 * 1000 // 25569 = 1970-01-01 的 Excel 序列号
+      const d = new Date(ms)
+      if (!isNaN(d.getTime())) return this.formatDate(d)
+    }
+    if (typeof value === 'object' && value !== null) {
+      // 富文本 { richText: [{ text, font? }, ...] }
+      const rich = (value as any).richText
+      if (Array.isArray(rich)) {
+        return rich.map((p: any) => String(p.text ?? '')).join('')
+      }
+      // 公式 { formula, result } —— 已在外层 .result 提取，这里兜底
+      if ('result' in (value as any)) {
+        return this.stringifyCellValue((value as any).result)
+      }
+    }
+    return String(value)
+  }
+
+  /**
+   * Excel 时间戳范围：约 1（1900-01-01）到 100000+（2173 年以后）
+   * 排除明显不是日期的小整数（如 1-31 可能被误识为日期）
+   * 策略：只在数字 ≥ 10000（约 1927 年）时认为是日期
+   */
+  private looksLikeExcelDateSerial(n: number): boolean {
+    return Number.isFinite(n) && n >= 10000 && n < 200000
+  }
+
+  /**
+   * Date → "YYYY-MM-DD" 或 "YYYY-MM-DD HH:mm"（带非零时间）
+   */
+  private formatDate(d: Date): string {
+    const pad = (n: number) => n.toString().padStart(2, '0')
+    const y = d.getFullYear()
+    const m = pad(d.getMonth() + 1)
+    const day = pad(d.getDate())
+    const hh = pad(d.getHours())
+    const mm = pad(d.getMinutes())
+    // 0 点整不带时间，避免噪音
+    if (d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) {
+      return `${y}-${m}-${day}`
+    }
+    return `${y}-${m}-${day} ${hh}:${mm}`
   }
 
   /**
@@ -558,6 +619,131 @@ export class RagService {
     await this.ragFileRepository.delete(id)
   }
 
+  /**
+   * 【P1-3】拉取 SQL 轨道引用的真实行数据
+   * 用于前端引用预览弹窗渲染"迷你表格"：
+   *   - 入参: fileId, sheetName, rowIndices (1-based，与 Excel 行号一致)
+   *   - 出参: { columns: string[], rows: Array<Record<string, string | number | null>> }
+   *
+   * 实现：从磁盘重读 xlsx（不重做向量化，只取单元格值）→ 找到 sheet → 按 rowIndex 抽取。
+   * Date 单元格友好化（YYYY-MM-DD）与 ETL 阶段保持一致，确保引用预览与召回文案对得上。
+   *
+   * 注意：只在 ragTrack='sql' 且扩展名是 .xlsx/.xls/.csv 时有意义；其他类型返回空结构。
+   */
+  async getStructuredRows(
+    fileId: number,
+    sheetName: string,
+    rowIndices: number[],
+  ): Promise<{ columns: string[]; rows: Array<Record<string, unknown>>; sheetName: string }> {
+    const empty = { columns: [] as string[], rows: [] as Array<Record<string, unknown>>, sheetName }
+    if (!Array.isArray(rowIndices) || rowIndices.length === 0) return empty
+
+    const record = await this.ragFileRepository.findOneBy({ id: fileId })
+    if (!record) throw new Error('文件不存在')
+    if (record.ragTrack !== RagTrackEnum.SQL) {
+      return empty // 非 SQL 轨道没"行"概念
+    }
+
+    // 从 DB 记录的 fileUrl 提取物理路径（fileUrl = `${serveRoot}/rag/${diskFilename}`）
+    // 不能依赖 controller 的 in-memory state（this.serveRoot 私有），
+    // 反查 fileUrl → 取 /rag/ 之后的文件名 → 拼成绝对路径
+    const fileUrl = record.fileUrl || ''
+    const m = fileUrl.match(/\/rag\/([^/?#]+)$/)
+    if (!m) {
+      // 退化：fileUrl 找不到 rag segment，按 record.fileName 路径试
+      return empty
+    }
+    const diskFilename = m[1]
+    const absPath = path.join(RAG_UPLOAD_DIR, diskFilename)
+    const ext = path.extname(record.fileName || '').toLowerCase()
+
+    // 读 buffer
+    const fs = await import('fs')
+    let buffer: Buffer
+    try {
+      buffer = await fs.promises.readFile(absPath)
+    } catch {
+      throw new Error(`文件已离线：${absPath}`)
+    }
+
+    let columns: string[] = []
+    const rows: Array<Record<string, unknown>> = []
+
+    if (ext === '.csv') {
+      const wb = XLSX.read(buffer as any, { type: 'buffer' })
+      const target = wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0]
+      if (!target) return empty
+      const sheet = wb.Sheets[target]
+      const arr = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: null })
+      if (arr.length === 0) return empty
+      // 列名：第一行 keys
+      const first = arr[0] || {}
+      columns = Object.keys(first).map((k, i) => (k && k.trim() ? k.trim() : `col_${i + 1}`))
+      // 唯一列名（去重）
+      columns = this.dedupeColumns(columns)
+      // rowIndices 1-based → arr 是 0-based
+      for (const r of rowIndices) {
+        const idx = r - 2 // 第 1 行是表头 → 数据从 index 0 开始；r=2 对应 arr[0]
+        if (idx >= 0 && idx < arr.length) {
+          const obj: Record<string, unknown> = {}
+          columns.forEach((c, i) => {
+            const origKey = Object.keys(first)[i]
+            obj[c] = this.stringifyCellValue(arr[idx]?.[origKey])
+          })
+          rows.push(obj)
+        }
+      }
+    } else {
+      // .xlsx / .xls
+      const wb = new ExcelJS.Workbook()
+      await wb.xlsx.load(buffer as any)
+      const ws = wb.getWorksheet(sheetName)
+      if (!ws) return empty
+      // 表头（第 1 行）
+      const headerRow = ws.getRow(1)
+      const rawCols: string[] = []
+      for (let c = 1; c <= headerRow.cellCount; c++) {
+        const v = headerRow.getCell(c).value
+        const col = v === null || v === undefined || (typeof v === 'string' && v.trim() === '')
+          ? `col_${c}`
+          : String(v).trim()
+        rawCols.push(col)
+      }
+      columns = this.dedupeColumns(rawCols)
+      // 按 rowIndices 取行
+      for (const r of rowIndices) {
+        if (r < 1) continue
+        const row = ws.getRow(r)
+        if (!row) continue
+        const obj: Record<string, unknown> = {}
+        for (let c = 1; c <= columns.length; c++) {
+          let v: unknown = row.getCell(c).value
+          // 公式 → result
+          if (v && typeof v === 'object' && 'result' in (v as any)) v = (v as any).result
+          // 复对象：富文本提取
+          obj[columns[c - 1]] = this.stringifyCellValue(v)
+        }
+        rows.push(obj)
+      }
+    }
+
+    return { columns, rows, sheetName }
+  }
+
+  /**
+   * ExcelJS 解析时如果表头有重名列，Qdrant metadata.columns 是直接保留重名。
+   * 预览时为了 el-table 能 v-for，需要把重名列改名 col_2 / col_3 ...
+   * 注意：这只是"展示用"的去重，不影响 ETL 召回的 metadata.columns。
+   */
+  private dedupeColumns(cols: string[]): string[] {
+    const seen = new Map<string, number>()
+    return cols.map((c) => {
+      const count = seen.get(c) || 0
+      seen.set(c, count + 1)
+      return count === 0 ? c : `${c}_${count + 1}`
+    })
+  }
+
   // ============================================================================
   // 💬【P1-2】会话 & 消息 CRUD
   // ============================================================================
@@ -712,9 +898,18 @@ export class RagService {
             url: this.qdrantUrl,
             collectionName: this.collectionName,
           })
-          const raw = await vectorStore.similaritySearchWithScore(question, 4, {
-            filter: { must: [{ key: 'metadata.fileId', match: { any: sources } }] },
-          } as any)
+          // ⚠️ Qdrant 的 `match.any` 只对 array 字段有效，对 scalar int 字段会返回 0 命中。
+          // 单值用 `match: { value: X }`；多值用 `should` 拼多个 value 子句（语义等同"或"）。
+          const filter: any =
+            sources.length === 1
+              ? { must: [{ key: 'metadata.fileId', match: { value: sources[0] } }] }
+              : {
+                  should: sources.map((id) => ({
+                    key: 'metadata.fileId',
+                    match: { value: id },
+                  })),
+                }
+          const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
           relevantDocs = raw.map(([doc, score]) => ({ doc, score }))
         } catch (vErr) {
           relevantDocs = []
@@ -742,21 +937,45 @@ export class RagService {
         res.write(`data: ${JSON.stringify({ code: 'sources', data: citations })}\n\n`)
 
         // 【P1-3】SQL 轨道走"行级上下文"格式，长文本维持原样
+        // 关键升级：SQL 轨道除了 pageContent，还把 rowIndices + columns 结构化元信息塞进 prompt
+        // —— LLM 知道"第几行"、列名是什么，能精准引用（如"华东 A 产品的销量（第 2 行）是 120"）
         const hasSqlTrack = relevantDocs.some((d) => d.doc.metadata?.ragTrack === 'sql')
         const contextText = hasSqlTrack
           ? relevantDocs
               .map(({ doc }) => {
-                const tag = doc.metadata?.sheetName
-                  ? `【表格行级参考: ${doc.metadata.fileName} / ${doc.metadata.sheetName}】`
-                  : `【参考源: ${doc.metadata?.fileName}】`
-                return `${tag}\n${doc.pageContent}`
+                const m = doc.metadata || {}
+                if (!m.sheetName) {
+                  return `【参考源: ${m.fileName}】\n${doc.pageContent}`
+                }
+                // 🔧 关键：把列名 + 行号范围 + 行级内容一起拼，LLM 才知道"哪个单元格在第几行"
+                const cols = Array.isArray(m.columns) && m.columns.length > 0 ? m.columns.join(' | ') : '(无列名)'
+                const rowList = Array.isArray(m.rowIndices) && m.rowIndices.length > 0
+                  ? m.rowIndices.length <= 20
+                    ? m.rowIndices.join(', ')
+                    : `${m.rowIndices.slice(0, 8).join(', ')} … ${m.rowIndices.slice(-3).join(', ')} (共 ${m.rowIndices.length} 行)`
+                  : '(无行号)'
+                return `【表格行级参考: ${m.fileName} / ${m.sheetName}】
+  - 列名: ${cols}
+  - 涉及行号 (Excel 1-based): ${rowList}
+  - 行级数据:
+${doc.pageContent}`
               })
               .join('\n\n')
           : relevantDocs.map(({ doc }) => `【参考源: ${doc.metadata?.fileName}】\n${doc.pageContent}`).join('\n\n')
 
         const systemPrompt = hasSqlTrack
-          ? `你是一款高级 AI 助手。用户的问题是关于结构化表格的，请严格基于下方"表格行级参考"回答：\n- 若问题要求统计/求和/比较，请用引用行里给出的字段值进行精确计算；\n- 不要凭空捏造数字。\n\n【参考资料】:\n${contextText}`
-          : `你是一款高级 AI 助手。请严格基于参考内容回答问题。\n\n【参考资料】:\n${contextText}`
+          ? `你是一款高级 AI 助手，专精于结构化表格的精准问答。回答规范：
+1) 严格基于下方"表格行级参考"中的字段值与行号进行精确计算，不要凭空捏造数字。
+2) 涉及具体单元格时，引用形式形如「{列名}={值}（第 {行号} 行 / {sheetName}）」，让用户能精准回溯。
+3) 涉及统计/求和/比较时，先列出你引用的行号，再给出计算过程，最后给结论。
+4) 若问题无法在参考表格中找到答案，明确告知"在所引用的表格行中未找到依据"，禁止臆测。
+
+【参考资料】:
+${contextText}`
+          : `你是一款高级 AI 助手。请严格基于参考内容回答问题。
+
+【参考资料】:
+${contextText}`
 
         res.write(
           `data: ${JSON.stringify({

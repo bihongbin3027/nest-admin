@@ -256,11 +256,11 @@
       </div>
     </div>
 
-    <!-- 🌟【P1-2】引用原文预览弹窗 -->
+    <!-- 🌟【P1-2 + P1-3】引用原文预览弹窗 -->
     <el-dialog
       v-model="previewVisible"
       :title="previewCitation?.fileName || '引用原文预览'"
-      width="640px"
+      width="min(820px, 92vw)"
       append-to-body
       class="citation-preview-dialog"
     >
@@ -269,16 +269,53 @@
           <el-icon><Document /></el-icon>
           <span class="preview-filename">{{ previewCitation.fileName }}</span>
           <span class="preview-divider">·</span>
-          <span class="preview-chunk">切片 #{{ previewCitation.chunkIndex }}</span>
+          <span v-if="previewCitation.ragTrack === 'sql' && previewCitation.sheetName" class="preview-chunk">
+            <el-icon><Grid /></el-icon> {{ previewCitation.sheetName }}
+          </span>
+          <span v-else class="preview-chunk">切片 #{{ previewCitation.chunkIndex }}</span>
+          <span
+            v-if="
+              previewCitation.ragTrack === 'sql' && previewCitation.rowIndices && previewCitation.rowIndices.length > 0
+            "
+            class="preview-chunk"
+          >
+            行 {{ formatRowRange(previewCitation.rowIndices) }}
+          </span>
           <span v-if="previewCitation.score !== null" class="preview-score">
             <span class="score-dot"></span>
             相关度 {{ formatScore(previewCitation.score) }}
           </span>
         </div>
-        <div class="preview-body">
+
+        <!-- 【P1-3】SQL 轨道：渲染真实行表格 -->
+        <div v-if="previewCitation.ragTrack === 'sql'" class="preview-table-wrapper" v-loading="previewTableLoading">
+          <table v-if="previewTableData && previewTableData.columns.length > 0" class="preview-table">
+            <thead>
+              <tr>
+                <th class="row-num-th">行号</th>
+                <th v-for="col in previewTableData.columns" :key="col" :title="col">{{ col }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, ri) in previewTableData.rows" :key="ri">
+                <td class="row-num-td">{{ previewCitation.rowIndices?.[ri] ?? '-' }}</td>
+                <td v-for="col in previewTableData.columns" :key="col">{{ row[col] ?? '' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="preview-empty">该引用未关联有效行数据</div>
+        </div>
+
+        <!-- VECTOR 轨道：维持 280 字 snippet -->
+        <div v-else class="preview-body">
           {{ previewCitation.content }}
         </div>
-        <div class="preview-tip">
+
+        <div v-if="previewCitation.ragTrack === 'sql'" class="preview-tip">
+          <el-icon><InfoFilled /></el-icon>
+          表格行数据为该引用命中的实际单元格值；如需编辑原表请前往知识库管理。
+        </div>
+        <div v-else class="preview-tip">
           <el-icon><InfoFilled /></el-icon>
           引用片段最多展示 280 字；如需查看完整原文，请在知识库管理中打开该文件。
         </div>
@@ -325,6 +362,7 @@ import {
   listRagSessionMessages,
   renameRagSession,
   deleteRagSession,
+  fetchStructuredRows,
   type RagAssetItem,
   type CitationItem,
   type RagSessionItem
@@ -364,9 +402,16 @@ const inputQuery = ref('')
 const streamingActive = ref(false)
 const scrollbarRef = ref()
 
-// 🌟【P1-2】引用预览弹窗
+// 🌟【P1-2 + P1-3】引用预览弹窗
 const previewVisible = ref(false)
 const previewCitation = ref<CitationItem | null>(null)
+// 【P1-3】SQL 引用预览的迷你表格数据
+const previewTableLoading = ref(false)
+const previewTableData = ref<{
+  sheetName: string
+  columns: string[]
+  rows: Array<Record<string, string | number | null>>
+} | null>(null)
 
 const fetchKnowledgeSources = async () => {
   sourcesLoading.value = true
@@ -503,9 +548,28 @@ const toggleCitations = (index: number) => {
   if (msg) msg.sourcesExpanded = !msg.sourcesExpanded
 }
 
-const openCitationPreview = (src: CitationItem) => {
+const openCitationPreview = async (src: CitationItem) => {
   previewCitation.value = src
   previewVisible.value = true
+  previewTableData.value = null
+  // 【P1-3】SQL 引用 → 拉真实行数据渲染迷你表格
+  if (src.ragTrack === 'sql' && src.sheetName && src.rowIndices && src.rowIndices.length > 0) {
+    previewTableLoading.value = true
+    try {
+      const res: any = await fetchStructuredRows({
+        fileId: src.fileId,
+        sheetName: src.sheetName,
+        rowIndices: src.rowIndices
+      })
+      previewTableData.value = res?.data || null
+    } catch (err) {
+      console.error('拉取结构化行数据失败', err)
+      ElMessage.warning('无法加载行数据预览')
+      previewTableData.value = null
+    } finally {
+      previewTableLoading.value = false
+    }
+  }
 }
 
 const goToRagManagement = () => {
@@ -1415,6 +1479,69 @@ onMounted(async () => {
   word-break: break-word;
   max-height: 360px;
   overflow-y: auto;
+}
+
+/* 【P1-3】SQL 引用预览迷你表格 */
+.preview-table-wrapper {
+  background-color: var(--rag-bg-container);
+  border: 1px solid var(--rag-border-sub);
+  border-left: 3px solid var(--el-color-warning);
+  border-radius: 0 10px 10px 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 4px 0;
+}
+
+.preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.preview-table thead th {
+  position: sticky;
+  top: 0;
+  background-color: var(--rag-card-hover);
+  font-weight: 600;
+  color: var(--rag-text-title);
+  padding: 10px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--rag-border-color);
+  white-space: nowrap;
+  z-index: 1;
+}
+
+.preview-table tbody td {
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--rag-border-sub);
+  color: var(--rag-text-main);
+  vertical-align: top;
+  word-break: break-word;
+}
+
+.preview-table tbody tr:hover {
+  background-color: var(--rag-card-hover);
+}
+
+.preview-table .row-num-th,
+.preview-table .row-num-td {
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+  color: var(--rag-text-sub);
+  text-align: right;
+  background-color: var(--rag-card-item);
+  font-size: 11px;
+  font-weight: 600;
+  width: 48px;
+  flex-shrink: 0;
+  position: sticky;
+  left: 0;
+}
+
+.preview-empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--rag-text-sub);
+  font-size: 13px;
 }
 
 .preview-tip {
