@@ -530,11 +530,7 @@ const fetchKnowledgeSources = async () => {
       return result
     }
     treeData.value = await buildSubtree(0)
-    // 默认展开前 3 个根节点
-    defaultExpandedKeys.value = treeData.value
-      .filter((n) => n.isFolder === 1)
-      .slice(0, 3)
-      .map((n) => n.id)
+    defaultExpandedKeys.value = []
     treeAllExpanded.value = false
   } catch (err) {
     console.error('知识库拉取失败，请检查服务端是否启动', err)
