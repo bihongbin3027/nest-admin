@@ -205,6 +205,14 @@
                 </div>
                 <div class="bubble-content" v-html="renderMarkdown(msg.content)"></div>
 
+                <!-- 【P2-1】停止徽标：用户主动中断时贴在内容下方，保留至此前已流出的字符 -->
+                <div v-if="msg.stopped" class="stopped-badge">
+                  <el-icon><VideoPause /></el-icon>
+                  <span>
+                    {{ msg.content ? '已停止生成（保留至此前的内容）' : '已停止生成（本次未返回任何内容）' }}
+                  </span>
+                </div>
+
                 <div v-if="msg.role === 'assistant' && msg.sources && msg.sources.length > 0" class="citations-wrapper">
                   <div class="citations-header" @click="toggleCitations(index)">
                     <el-icon class="citations-icon"><Paperclip /></el-icon>
@@ -297,11 +305,12 @@
             <el-button
               type="primary"
               class="send-plasma-btn"
-              :loading="streamingActive"
-              :disabled="!inputQuery.trim()"
-              @click="submitQuery"
+              :class="{ 'is-stop': streamingActive }"
+              :disabled="!streamingActive && !inputQuery.trim()"
+              @click="streamingActive ? stopStreaming() : submitQuery()"
             >
               <el-icon v-if="!streamingActive"><Position /></el-icon>
+              <el-icon v-else><VideoPause /></el-icon>
             </el-button>
           </div>
         </div>
@@ -394,6 +403,7 @@ import {
   Collection,
   User,
   Position,
+  VideoPause,
   DataAnalysis,
   DocumentCopy,
   CircleCheck,
@@ -445,6 +455,8 @@ interface ChatMessage {
   content: string
   sources?: CitationItem[]
   sourcesExpanded?: boolean
+  // 【P2-1】用户主动中断后置 true，UI 渲染"已停止生成"徽标
+  stopped?: boolean
 }
 
 // ============================================================================
@@ -630,6 +642,10 @@ const inputQuery = ref('')
 const streamingActive = ref(false)
 const scrollbarRef = ref()
 
+// 🌟【P2-1】当前流式请求的 AbortController，停止按钮触发 abort
+// 旧值在 finally 里清理，保证下一次 submit 能拿到全新 controller
+const abortControllerRef = ref<AbortController | null>(null)
+
 // 🌟【P1-2 + P1-3】引用预览弹窗
 const previewVisible = ref(false)
 const previewCitation = ref<CitationItem | null>(null)
@@ -799,6 +815,10 @@ const submitQuery = async () => {
   const aiMessageIndex = chatHistory.value.length - 1
   await scrollToBottom()
 
+  // 【P2-1】为本次请求创建独立 AbortController，停止按钮 abort 它
+  const ac = new AbortController()
+  abortControllerRef.value = ac
+
   try {
     await askQuestionStreamApi(
       {
@@ -833,17 +853,45 @@ const submitQuery = async () => {
             chatHistory.value[aiMessageIndex].content = `❌ 集群阻断: ${msg}`
           }
         }
-      }
+      },
+      { signal: ac.signal }
     )
     // 流结束后刷新会话列表（标题可能自动改写了）
     await fetchSessions()
   } catch (error: any) {
-    if (!chatHistory.value[aiMessageIndex].content) {
+    // 【P2-1】用户主动中止：axios 抛 CanceledError，不当作错误处理，
+    // stopStreaming 已经在 abort 前把最后一条 AI 消息标了 stopped=true
+    const isCanceled = error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED'
+    if (isCanceled) {
+      // 正常退出，保持 partial content
+    } else if (!chatHistory.value[aiMessageIndex].content) {
       chatHistory.value[aiMessageIndex].content = `❌ 网络异常: 与局域网 RAG 服务器连接超时`
     }
   } finally {
     streamingActive.value = false
+    abortControllerRef.value = null
     await scrollToBottom()
+  }
+}
+
+/**
+ * 【P2-1】主动停止当前流式问答
+ * 1) 给最后一条 AI 消息打 `stopped: true` 标（保留 partial content）
+ * 2) 触发 AbortController → axios 立即 reject → 后端 req close → service 退出 LLM 循环
+ * 3) finally 里 streamingActive 翻回 false，按钮自动切回"发送"
+ */
+const stopStreaming = () => {
+  const ac = abortControllerRef.value
+  const lastMsg = chatHistory.value[chatHistory.value.length - 1]
+  if (lastMsg && lastMsg.role === 'assistant') {
+    lastMsg.stopped = true
+  }
+  if (ac) {
+    try {
+      ac.abort()
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -1443,6 +1491,30 @@ onMounted(async () => {
   font-family: monospace;
   font-size: 13px;
   color: #dc2626;
+}
+
+/* 【P2-1】用户主动中断后的徽标 —— flex + center 强制图标和文本中线对齐 */
+.stopped-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1;
+  color: #f59e0b;
+  background-color: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 4px;
+}
+.stopped-badge .el-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  /* icon 自身高度 = 行高，避免和文字 baseline 错位 */
+  height: 1em;
+  line-height: 1;
 }
 .bubble-content :deep(pre) {
   background-color: var(--rag-bg-container);

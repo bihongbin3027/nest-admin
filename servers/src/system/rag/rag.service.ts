@@ -1026,6 +1026,7 @@ export class RagService {
     sources: number[],
     res: Response,
     userId: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     // 1) 解析/创建会话
     let ownedSession: RagSessionEntity | null = null
@@ -1067,7 +1068,7 @@ export class RagService {
         res.write(
           `data: ${JSON.stringify({ code: 200, data: '未在参考资料中发现线索，转由大语言模型泛化解答：\n\n' })}\n\n`,
         )
-        fullAnswer = await this.streamLlmWithHistory(history, question, null, res)
+        fullAnswer = await this.streamLlmWithHistory(history, question, null, res, signal)
       } else {
         citations = relevantDocs.map(({ doc, score }) => ({
           fileId: doc.metadata?.fileId,
@@ -1132,32 +1133,72 @@ ${contextText}`
               : '已为您提炼关联企业物料，深度解答中：\n\n',
           })}\n\n`,
         )
-        fullAnswer = await this.streamLlmWithHistory(history, question, systemPrompt, res)
+        fullAnswer = await this.streamLlmWithHistory(history, question, systemPrompt, res, signal)
       }
     } catch (err) {
-      this.logger.error('[RAG 运行流内部异常捕捉并安全消化]', err)
-      const errorDetails = err instanceof Error ? err.message : '大模型集群响应超时'
-      res.write(`data: ${JSON.stringify({ code: 500, data: `\n[系统决策阻断]: ${errorDetails}` })}\n\n`)
+      // 【P2-1】客户端主动 abort 不视作错误，安静退出即可
+      const aborted = (err as any)?.name === 'AbortError' || signal?.aborted === true
+      if (aborted) {
+        this.logger.log(`[RAG] 流式被客户端中止，未返回完整内容 sessionId=${ownedSession.id} partialLen=${fullAnswer.length}`)
+      } else {
+        this.logger.error('[RAG 运行流内部异常捕捉并安全消化]', err)
+        const errorDetails = err instanceof Error ? err.message : '大模型集群响应超时'
+        // 客户端已断开就别再 write 了（会抛 ERR_STREAM_DESTROYED）
+        if (!res.writableEnded) {
+          try {
+            res.write(`data: ${JSON.stringify({ code: 500, data: `\n[系统决策阻断]: ${errorDetails}` })}\n\n`)
+          } catch { /* ignore */ }
+        }
+      }
     } finally {
-      // 3) 持久化本轮对话
+      // 【P2-1】abort 场景：user 消息永远要存（用户确实问过这个问题，要保留历史），
+      // assistant 只在有内容时才存（避免历史里出现"问了但没答"的幽灵空气泡）
+      const abortedEmpty = signal?.aborted && fullAnswer.length === 0
       try {
-        await this.appendTurn(ownedSession.id, question, fullAnswer, citations)
+        if (abortedEmpty) {
+          await this.ragMessageRepository.save(
+            this.ragMessageRepository.create({
+              sessionId: ownedSession.id,
+              role: 'user',
+              content: question,
+              citations: null,
+            }),
+          )
+          await this.ragSessionRepository.update(ownedSession.id, { updatedAt: new Date() })
+          this.logger.log(`[RAG] abort+空内容：仅持久化 user 消息 sessionId=${ownedSession.id}`)
+        } else {
+          await this.appendTurn(ownedSession.id, question, fullAnswer, citations)
+        }
       } catch (persistErr) {
         this.logger.error(`[RAG 会话持久化失败] sessionId=${ownedSession.id}`, persistErr as any)
       }
-      res.write(`data: ${JSON.stringify(ResultData.ok(''))}\n\n`)
+      // 【P2-1】res 已 end 时不要重复写
+      if (!res.writableEnded) {
+        try {
+          res.write(`data: ${JSON.stringify(ResultData.ok(''))}\n\n`)
+        } catch { /* ignore */ }
+      }
     }
   }
 
   /**
-   * 把历史 + 当前问题拼成 LangChain messages，调用 LLM 流式输出并拼接完整文本
+   * 【P2-1】把历史 + 当前问题拼成 LangChain messages，调用 LLM 流式输出并拼接完整文本
+   *
+   * 接受可选的 AbortSignal：客户端断开连接时 controller 触发 abort，LangChain 的
+   * `llm.stream(messages, { signal })` 会抛 AbortError 终止上游 token 拉取，避免
+   * 浪费 LLM 配额（继续推完的 token 会被 res.write 失败吞掉，纯亏钱）。
+   *
+   * 同时循环内主动 check `signal.aborted` 兜底：某些 LangChain 版本不一定把
+   * signal 传到所有底层 SDK，遇到 chunk 写入 res 失败时立刻退出。
    */
   private async streamLlmWithHistory(
     history: HistoryTurn[],
     question: string,
     systemPrompt: string | null,
     res: Response,
+    signal?: AbortSignal,
   ): Promise<string> {
+    if (signal?.aborted) return ''
     const messages: Array<['system' | 'human' | 'assistant', string]> = []
     if (systemPrompt) messages.push(['system', systemPrompt])
     for (const turn of history) {
@@ -1165,13 +1206,23 @@ ${contextText}`
     }
     messages.push(['human', question])
 
-    const responseStream = await this.llm.stream(messages as any)
+    const responseStream = await this.llm.stream(messages as any, { signal } as any)
     let full = ''
     for await (const chunk of responseStream) {
+      if (signal?.aborted) {
+        this.logger.log(`[RAG] 流式 chunk 循环中检测到 abort，停止读取 LLM 后续 token（已累积 ${full.length} 字符）`)
+        break
+      }
       const content = typeof chunk === 'string' ? chunk : (chunk as any).content || ''
       if (content) {
         full += content
-        res.write(`data: ${JSON.stringify({ code: 200, data: content })}\n\n`)
+        try {
+          res.write(`data: ${JSON.stringify({ code: 200, data: content })}\n\n`)
+        } catch (writeErr) {
+          // res 已被对端关闭（abort 后内核会触发 close 事件），res.write 抛错直接退出
+          this.logger.warn(`[RAG] res.write 失败（客户端可能已断开），提前终止流: ${(writeErr as any)?.message}`)
+          break
+        }
       }
     }
     return full

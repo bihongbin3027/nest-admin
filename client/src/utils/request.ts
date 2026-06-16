@@ -31,6 +31,14 @@ function createService() {
     async (error: AxiosError<any>) => {
       const response = error.response
       const config = response?.config as AxiosRequestConfig
+      // 【P2-1 补丁】调用方主动 abort（流式问答停止按钮 / 路由切换 / 组件卸载）时
+      // axios 会抛 CanceledError，error.response 是 undefined。
+      // 这种情况不是"服务端错误"，必须静默 return，否则 utils/request.ts 会兜底弹通知。
+      // 注意：axios.isCancel 是 type guard，会把 error narrow 成 CanceledError，
+      // 影响下面 else 分支里 error.message 的类型推断，所以这里用 as any 保护。
+      if (axios.isCancel(error as any) || (error as any)?.code === 'ERR_CANCELED') {
+        return Promise.reject(error)
+      }
       if (response?.status === 401) {
         if (getRTExp() <= Date.now()) {
           // 刷新token 过期了

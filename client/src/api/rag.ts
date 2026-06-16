@@ -170,7 +170,10 @@ export interface StreamCallbacks {
 
 export function askQuestionStreamApi(
   data: { question: string; sessionId?: number | null; sources?: number[] },
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  // 【P2-1】外部 AbortSignal：调用方传 controller.signal，停止按钮触发 controller.abort()
+  // axios 检测到 signal abort 会抛 CanceledError，原 promise 直接 reject
+  options?: { signal?: AbortSignal }
 ) {
   const { onChunk, onSources, onSession, onError } = callbacks
 
@@ -180,6 +183,7 @@ export function askQuestionStreamApi(
     data,
     responseType: 'text',
     timeout: 100000,
+    signal: options?.signal,
     onDownloadProgress: (progressEvent) => {
       const rawText = progressEvent.event.target.responseText
       if (!rawText) return

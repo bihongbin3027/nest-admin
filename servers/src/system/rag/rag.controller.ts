@@ -235,6 +235,20 @@ export class RagController {
     res.setHeader('Connection', 'keep-alive')
     res.setHeader('X-Accel-Buffering', 'no')
 
+    // 【P2-1】客户端主动断开（abort / 关页 / 网络断）时，立刻触发 signal，
+    // 让 service 里的 LLM stream 循环尽快退出，停止消耗 token。
+    //
+    // 关键：必须用 `res.on('close')` 而不是 `req.on('close')`。
+    // 验证发现 fetch + AbortController.abort() 不会立即让 req 触发 close，
+    // 但 Express 的 response writable stream 会在对端断开时立刻 emit 'close'。
+    // 同时再监听 'error' / 'finish' 兜底，确保任何终止路径都覆盖到。
+    const ac = new AbortController()
+    const fireAbort = () => {
+      if (!ac.signal.aborted) ac.abort()
+    }
+    res.on('close', fireAbort)
+    res.on('error', fireAbort)
+
     const userId = this.resolveUserId(req)
     const question = dto.question || ''
     const sessionId = dto.sessionId ?? null
@@ -245,14 +259,22 @@ export class RagController {
         res.write(`data: ${JSON.stringify(ResultData.fail(401, '未识别到用户身份，请重新登录'))}\n\n`)
         return
       }
-      await this.ragService.executeDualTrackQuery(question, sessionId, sources, res, userId)
+      await this.ragService.executeDualTrackQuery(question, sessionId, sources, res, userId, ac.signal)
     } catch (error) {
       console.error('[RAG Controller 顶层防线捕捉]', error)
       const errorMessage = error instanceof Error ? error.message : '服务器内部发生决策性阻断'
-      res.write(`data: ${JSON.stringify(ResultData.fail(500, errorMessage))}\n\n`)
+      if (!res.writableEnded) {
+        try {
+          res.write(`data: ${JSON.stringify(ResultData.fail(500, errorMessage))}\n\n`)
+        } catch { /* ignore */ }
+      }
     } finally {
-      res.write(`data: ${JSON.stringify(ResultData.ok(null, 'stream_ended'))}\n\n`)
-      res.end()
+      if (!res.writableEnded) {
+        try {
+          res.write(`data: ${JSON.stringify(ResultData.ok(null, 'stream_ended'))}\n\n`)
+        } catch { /* ignore */ }
+        res.end()
+      }
     }
   }
 }
