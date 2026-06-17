@@ -67,6 +67,14 @@ export class RagMetricsService {
     registers: [defaultRegistry],
   })
 
+  // 【P1-3】熔断器状态指标：1=open/halfOpen，0=closed
+  public readonly circuitBreakerState = new Gauge({
+    name: 'rag_circuit_breaker_state',
+    help: '熔断器状态（1=open/halfOpen 表示已触发熔断，0=closed 正常）',
+    labelNames: ['name', 'state'] as const,
+    registers: [defaultRegistry],
+  })
+
   recordEtlComplete(status: 'success' | 'failed', durationSeconds: number): void {
     this.etlTotal.inc({ status })
     this.etlDuration.observe(durationSeconds)
@@ -90,5 +98,14 @@ export class RagMetricsService {
     if (topScore !== null && Number.isFinite(topScore)) {
       this.vectorSearchScore.observe(topScore)
     }
+  }
+
+  /**
+   * 上报熔断器状态变化（由 opossum onStateChange 回调触发）
+   */
+  setCircuitBreakerState(name: string, state: 'closed' | 'open' | 'halfOpen'): void {
+    // 简化：open/halfOpen 都记为 1（异常），closed 记为 0（正常）
+    const value = state === 'closed' ? 0 : 1
+    this.circuitBreakerState.set({ name, state }, value)
   }
 }

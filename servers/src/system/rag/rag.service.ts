@@ -21,6 +21,7 @@ import { RagMessageEntity } from './rag-message.entity'
 import { ResultData } from '../../common/utils/result'
 import { RAG_UPLOAD_DIR } from './rag-upload.util'
 import { RagMetricsService } from '../../common/metrics/rag-metrics.service'
+import { limitAndBreaker } from '../../common/utils/circuit-breaker.util'
 
 /**
  * 【P1-2 / P1-3】引用源条目
@@ -74,6 +75,9 @@ class MiniMaxEmbeddings extends Embeddings {
   private readonly baseURL: string
   private readonly modelName: string
   private readonly batchSize: number
+  // 【P1-3】embedding API 调用：限流（并发≤5）+ 熔断（错误率>50% 触发 30s 短路）
+  // 熔断器状态通过 metrics service 回调上报到 Prometheus
+  private readonly safeCall: (texts: string[], type: 'db' | 'query') => Promise<number[][]>
 
   constructor(params: MiniMaxEmbeddingsParams) {
     super(params)
@@ -81,9 +85,35 @@ class MiniMaxEmbeddings extends Embeddings {
     this.baseURL = params.baseURL.replace(/\/$/, '')
     this.modelName = params.modelName
     this.batchSize = params.batchSize ?? 16
+    // 实例化时构造熔断包装（需要在 RagService 注入 RagMetricsService 后初始化）
+    // 实际初始化在 RagService 构造时通过 setMetrics() 完成
+    this.safeCall = async () => {
+      throw new Error('MiniMaxEmbeddings.safeCall not initialized; call setMetrics() first')
+    }
   }
 
-  private async call(texts: string[], type: 'db' | 'query'): Promise<number[][]> {
+  /**
+   * 由 RagService 在构造时调用，注入 RagMetricsService + 构造限流熔断包装
+   */
+  setMetrics(metrics: RagMetricsService): void {
+    // 用类型断言绕过 readonly 限制（setMetrics 是初始化专用入口）
+    ;(this as any).safeCall = limitAndBreaker(
+      async (texts: string[], type: 'db' | 'query') => this.rawCall(texts, type),
+      { concurrency: 5 }, // 最多 5 个并发 embedding 调用（MiniMax API 默认 rate limit 通常 10+）
+      {
+        name: 'embedding',
+        errorThresholdPercentage: 50, // 错误率 > 50% 触发熔断
+        resetTimeout: 30000, // 熔断 30s 后半开探测
+        timeout: 30000, // 单次调用 30s 超时
+        onStateChange: (state) => metrics.setCircuitBreakerState('embedding', state),
+      },
+    )
+  }
+
+  /**
+   * 原始 fetch 调用（被熔断包装）
+   */
+  private async rawCall(texts: string[], type: 'db' | 'query'): Promise<number[][]> {
     if (texts.length === 0) return []
     const r = await fetch(`${this.baseURL}/embeddings`, {
       method: 'POST',
@@ -109,14 +139,14 @@ class MiniMaxEmbeddings extends Embeddings {
     const out: number[][] = []
     for (let i = 0; i < texts.length; i += this.batchSize) {
       const batch = texts.slice(i, i + this.batchSize)
-      const vecs = await this.call(batch, 'db')
+      const vecs = await this.safeCall(batch, 'db')
       out.push(...vecs)
     }
     return out
   }
 
   async embedQuery(text: string): Promise<number[]> {
-    const [v] = await this.call([text], 'query')
+    const [v] = await this.safeCall([text], 'query')
     return v
   }
 }
@@ -167,6 +197,10 @@ class SimpleSemaphore {
 
 @Injectable()
 export class RagService {
+  // 【P1-3】LLM 调用熔断包装：错误率 > 50% 触发 30s 短路
+  // 生成摘要 / sheet 摘要 / FAQ 都是 LLM.invoke 调用，统一熔断
+  private readonly safeLlmInvoke: (prompt: string) => Promise<any>
+
   // 【P0-2】上传白名单：只允许已知安全的扩展名（防可执行文件/宏文档绕过）
   // 与 parseDocumentToVectorStore / parseStructuredToVectorStore 实际处理的扩展名保持一致
   // 同步在 multer fileFilter（controller 层）和 ragTrack 判定（service 层）
@@ -205,6 +239,21 @@ export class RagService {
     this.llm = new ChatOpenAI({ apiKey, configuration: { baseURL }, modelName: chatModel, temperature: 0.2, streaming: true })
     // 🔧 用 MiniMax 兼容协议专用适配器（见上方 MiniMaxEmbeddings 类注释）
     this.embeddings = new MiniMaxEmbeddings({ apiKey, baseURL, modelName: embeddingModel })
+    // 【P1-3】注入 RagMetricsService 到 MiniMaxEmbeddings，让 embedding 调用走限流 + 熔断
+    this.embeddings.setMetrics(this.metrics)
+
+    // 【P1-3】LLM.invoke 熔断包装：与 embedding 独立熔断（错误率/超时分开统计）
+    this.safeLlmInvoke = limitAndBreaker(
+      async (prompt: string) => this.llm.invoke(prompt),
+      { concurrency: 8 }, // LLM 并发稍高（流式响应内部已经节流）
+      {
+        name: 'llm',
+        errorThresholdPercentage: 50,
+        resetTimeout: 30000,
+        timeout: 60000, // LLM 摘要生成可长一点（默认 60s 超时）
+        onStateChange: (state) => this.metrics.setCircuitBreakerState('llm', state),
+      },
+    )
   }
 
   // ============================================================================
@@ -651,7 +700,7 @@ export class RagService {
 文档内容：
 ${textForSummary}`
       // 非流式调用：ChatOpenAI.invoke() 会等完整响应返回
-      const response: any = await this.llm.invoke(prompt)
+      const response: any = await this.safeLlmInvoke(prompt)
       const summary = (typeof response?.content === 'string' ? response.content : String(response?.content || '')).trim()
       if (!summary) return null
       this.logger.log(`[P3-3 摘要] 文档摘要生成成功: ${fileName} → ${summary.length} 字`)
@@ -695,7 +744,7 @@ Sheet 名：${sheetName}
 列名：${columns.join('、')}
 前 5 行示例：
 ${sampleText}`
-      const response: any = await this.llm.invoke(prompt)
+      const response: any = await this.safeLlmInvoke(prompt)
       const summary = (typeof response?.content === 'string' ? response.content : String(response?.content || '')).trim()
       if (!summary) return null
       this.logger.log(`[P3-3 摘要] sheet 摘要生成成功: ${sheetName} → ${summary.length} 字`)
