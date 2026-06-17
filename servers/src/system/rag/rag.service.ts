@@ -447,6 +447,14 @@ export class RagService {
       vectorStatus: VectorStatusEnum.PROCESSING,
       errorMessage: null,
     })
+    // 【P0-1 收尾】retry 前先清旧 chunks：避免新旧向量叠加导致重复召回
+    // 失败不阻断 ETL（清不掉就让 ETL 跑完，重复召回是次要问题）
+    try {
+      await this.deleteQdrantPointsByFileId(fileId, record.userId)
+      this.logger.log(`[P0-1 重试清理] 已清旧 chunks fileId=${fileId} userId=${record.userId}`)
+    } catch (err: any) {
+      this.logger.warn(`[P0-1 重试清理] 清旧 chunks 失败（不阻断重跑）fileId=${fileId} ${err?.message || err}`)
+    }
     // fire-and-forget 调用 ETL（与 upload 接口一致行为）
     this.asyncProcessEtlPipeline(filePath, fileId, record.fileName, record.userId).catch((err) => {
       this.logger.error(`[P3-5 重试 ETL 异步管道崩溃] fileId=${fileId} ${err?.stack || err}`)
@@ -1153,14 +1161,19 @@ ${chunkText.slice(0, 1500)}`
    * 按 metadata.fileId 删除 Qdrant 中的所有相关点
    * 端点：POST {qdrantUrl}/collections/{collectionName}/points/delete
    */
-  private async deleteQdrantPointsByFileId(fileId: number): Promise<void> {
+  private async deleteQdrantPointsByFileId(fileId: number, userId?: number): Promise<void> {
     const url = `${this.qdrantUrl.replace(/\/$/, '')}/collections/${this.collectionName}/points/delete`
+    // 【P0-1】filter 同时含 fileId + userId（双重保险）：
+    //   - fileId：定位具体文件
+    //   - userId：防止越权误删他人文件（极端 case：fileId 跨用户复用或请求错位）
+    const filter: any = { must: [{ key: 'metadata.fileId', match: { value: fileId } }] }
+    if (typeof userId === 'number') {
+      filter.must.push({ key: 'metadata.userId', match: { value: userId } })
+    }
     const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        filter: { must: [{ key: 'metadata.fileId', match: { value: fileId } }] }
-      })
+      body: JSON.stringify({ filter })
     })
     if (r.ok) return
     // 404 通常意味着 collection 不存在（首次清理场景），忽略
