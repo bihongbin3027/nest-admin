@@ -120,6 +120,50 @@ class MiniMaxEmbeddings extends Embeddings {
   }
 }
 
+// ============================================================================
+// 🔁【P3-5】ETL 重试占位（实际方法在 RagService 类内）
+// ============================================================================
+
+/**
+ * 简单信号量：维护"已占用 / 最大允许"两个计数 + 等待队列。
+ * - acquire() 立即返回 if 计数 < max，否则 await 直到 release
+ * - release() 唤醒队列头部
+ *
+ * 用在 ETL 入口做"最多同时跑 N 个 ETL"控制，防止单实例被打挂。
+ * 进程级而非集群级（多实例部署需要替换成 Redis 信号量；单实例够用）。
+ */
+class SimpleSemaphore {
+  private current = 0
+  private queue: Array<() => void> = []
+
+  constructor(private readonly max: number) {}
+
+  async acquire(): Promise<void> {
+    if (this.current < this.max) {
+      this.current++
+      return
+    }
+    return new Promise<void>((resolve) => this.queue.push(resolve))
+  }
+
+  release(): void {
+    this.current--
+    const next = this.queue.shift()
+    if (next) {
+      this.current++
+      next()
+    }
+  }
+
+  get active(): number {
+    return this.current
+  }
+
+  get waiting(): number {
+    return this.queue.length
+  }
+}
+
 @Injectable()
 export class RagService {
   private readonly logger = new Logger(RagService.name)
@@ -127,6 +171,9 @@ export class RagService {
   private readonly embeddings: MiniMaxEmbeddings
   private readonly qdrantUrl: string
   private readonly collectionName: string
+  // 【P3-5】ETL 并发控制：最多同时跑 3 个 ETL，超出排队等待
+  // 防止大量并发上传击穿 embedding API 或 Qdrant
+  private readonly etlSemaphore = new SimpleSemaphore(3)
 
   constructor(
     @InjectRepository(RagFileEntity)
@@ -290,6 +337,13 @@ export class RagService {
    * @param originalName 原始文件名（用于在 metadata 保留）
    */
   async asyncProcessEtlPipeline(filePath: string, fileId: number, originalName: string): Promise<void> {
+    // 【P3-5】并发控制：超过 3 个并发时排队等待；并发日志方便排查
+    await this.etlSemaphore.acquire()
+    this.logger.log(
+      `[P3-5 ETL 启动] fileId=${fileId} 当前并发=${this.etlSemaphore.active}, 排队=${this.etlSemaphore.waiting}`,
+    )
+    // 【P3-5】ETL 计时埋点：从排队到完成的端到端耗时
+    const t0 = Date.now()
     try {
       const record = await this.ragFileRepository.findOneBy({ id: fileId })
       if (!record) return
@@ -330,7 +384,52 @@ export class RagService {
         vectorStatus: VectorStatusEnum.FAILED,
         errorMessage: stackFirstLine ? `${msg} | ${stackFirstLine}` : msg,
       })
+    } finally {
+      // 【P3-5】无论成功/失败/异常，必须释放信号量 + 记录耗时
+      const durationMs = Date.now() - t0
+      this.logger.log(
+        `[P3-5 ETL 完成] fileId=${fileId} 耗时=${durationMs}ms (并发=${this.etlSemaphore.active}, 排队=${this.etlSemaphore.waiting})`,
+      )
+      this.etlSemaphore.release()
     }
+  }
+
+  /**
+   * 【P3-5】触发指定 fileId 的 ETL 重跑。
+   * 仅当 status='failed' 或 'pending' 时允许（避免覆盖正在 processing 的任务）。
+   * 重置 status='processing' 后调用 asyncProcessEtlPipeline（fire-and-forget）。
+   * 文件物理路径仍存在于磁盘（RAG_UPLOAD_DIR），不需要重新上传。
+   */
+  async retryFailedEtl(fileId: number): Promise<{ ok: boolean; reason?: string }> {
+    const record = await this.ragFileRepository.findOneBy({ id: fileId })
+    if (!record) return { ok: false, reason: '文件不存在' }
+    if (record.isFolder === 1) return { ok: false, reason: '目录不能触发 ETL' }
+    if (record.vectorStatus === VectorStatusEnum.PROCESSING) {
+      return { ok: false, reason: '该文件 ETL 正在处理中，请等待完成后再试' }
+    }
+    if (record.vectorStatus === VectorStatusEnum.SUCCESS) {
+      return { ok: false, reason: '该文件 ETL 已成功，无需重试' }
+    }
+    // 从 fileUrl 反推物理路径：fileUrl 形如 /static/rag/{ts}_{name}
+    const fileName = (record.fileUrl || '').split('/').pop()
+    if (!fileName) return { ok: false, reason: '文件 URL 异常，无法定位物理文件' }
+    const filePath = path.join(RAG_UPLOAD_DIR, fileName)
+    // 检查物理文件是否还在
+    try {
+      await import('fs').then((m) => m.promises.access(filePath))
+    } catch {
+      return { ok: false, reason: '物理文件已丢失，请重新上传' }
+    }
+    // 重置状态为 processing + 清空 errorMessage
+    await this.ragFileRepository.update(fileId, {
+      vectorStatus: VectorStatusEnum.PROCESSING,
+      errorMessage: null,
+    })
+    // fire-and-forget 调用 ETL（与 upload 接口一致行为）
+    this.asyncProcessEtlPipeline(filePath, fileId, record.fileName).catch((err) => {
+      this.logger.error(`[P3-5 重试 ETL 异步管道崩溃] fileId=${fileId} ${err?.stack || err}`)
+    })
+    return { ok: true }
   }
 
   /**
@@ -386,8 +485,31 @@ export class RagService {
 
     if (!rawText.trim()) throw new Error('语料解析为空')
 
-    const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 600, chunkOverlap: 100 })
-    const chunks = await splitter.splitText(rawText)
+    // 【P3-1】md 文档按 markdown 结构切分（标题/段落/代码块边界优先），其余格式保持原 RCTS 行为
+    // 痛点：之前 md 走 RCTS 字符切，"## 二级标题" 这种半截会被切断，导致 chunk 嵌入向量偏向"残缺文本"
+    // 解决：md 用 RCTS 自定义 separators 列表，按 # ## ### 标题层级优先切，段落/代码块次之
+    let chunks: string[]
+    if (ext === '.md') {
+      const mdSplitter = new RecursiveCharacterTextSplitter({
+        chunkSize: 600,
+        chunkOverlap: 100,
+        separators: [
+          '\n# ',     // 一级标题
+          '\n## ',    // 二级标题
+          '\n### ',   // 三级标题
+          '\n#### ',  // 四级标题
+          '\n```\n',  // 代码块结束边界（独立 chunk）
+          '\n\n',     // 段落
+          '\n',       // 行
+          ' ',        // 词
+          '',         // 字符
+        ],
+      })
+      chunks = await mdSplitter.splitText(rawText)
+    } else {
+      const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 600, chunkOverlap: 100 })
+      chunks = await splitter.splitText(rawText)
+    }
     // ⚠️ file.originalname 已经被 asyncProcessEtlPipeline 在上游做过 latin1→utf8 解码，
     // 这里不要再解！直接用 file.originalname，否则会被"二次解码"重新打回乱码。
     // 用户报告过的乱码现象 l�����,��6�.xlsx 就是这行 double-decode 造成的。
@@ -402,6 +524,54 @@ export class RagService {
       })
     })
 
+    // 【P3-3】调用 LLM 生成整文档摘要，作为额外首 chunk 写入，提升跨段落召回率
+    // chunkType='summary' 标识，让前端 references 可以按类型区分展示
+    const summary = await this.generateDocumentSummary(rawText, file.originalname)
+    if (summary) {
+      documents.unshift(
+        new Document({
+          pageContent: `【文档摘要】${summary}`,
+          metadata: {
+            fileId: fileId,
+            fileName: file.originalname,
+            chunkIndex: -1, // 摘要固定 chunkIndex=-1，方便识别
+            chunkType: 'summary',
+          },
+        }),
+      )
+    }
+
+    // 【P3-4】为每个"普通段落 chunk"调 LLM 生成 3-5 个"用户可能问的问题"
+    // 这些 FAQ 作为辅助 chunk 写入，召回时"用户问题 ↔ FAQ 问题"匹配比"用户问题 ↔ 原文"更精准
+    // 超短 chunk (<100 字符) 跳过；summary chunk 也跳过（FAQ 不适合给整文档生成）
+    // 数量限制：每个文档最多 5 个 FAQ（避免长文档 LLM 调用爆炸，ETL 延迟失控）
+    const originalDocCount = documents.length
+    let faqCount = 0
+    const MAX_FAQ_PER_DOC = 5
+    for (let i = 0; i < documents.length; i++) {
+      if (faqCount >= MAX_FAQ_PER_DOC) break
+      const doc = documents[i]
+      const chunkType = (doc.metadata as any)?.chunkType
+      if (chunkType === 'summary') continue // 跳过摘要
+      const faqs = await this.generateChunkFAQs(doc.pageContent, file.originalname)
+      if (faqs.length === 0) continue
+      documents.push(
+        new Document({
+          pageContent: `【FAQ】${faqs.join('\n')}`,
+          metadata: {
+            fileId: fileId,
+            fileName: file.originalname,
+            chunkIndex: doc.metadata?.chunkIndex ?? i, // 关联到原 chunk
+            chunkType: 'faq',
+          },
+        }),
+      )
+      faqCount++
+    }
+    this.logger.log(
+      `[P3-4 FAQ] fileId=${fileId} 生成 ${documents.length - originalDocCount} 条 FAQ 辅助 chunks`,
+    )
+
     // 🔧 先用一个 dummy 文本探测当前 embedding 模型的真实维度（1536 for embo-01）
     const probeVec = await this.embeddings.embedQuery('__dim_probe__')
     await this.ensureQdrantCollection(probeVec.length)
@@ -410,6 +580,133 @@ export class RagService {
       url: this.qdrantUrl,
       collectionName: this.collectionName,
     })
+  }
+
+  // ============================================================================
+  // ============================================================================
+  // 📝【P3-3】LLM 文档摘要生成
+  // ============================================================================
+
+  /**
+   * 整文档摘要：把 rawText 喂给 LLM 生成 300-500 字中文摘要。
+   * 用于 ETL 阶段追加一个"全文摘要" chunk，提升跨段落召回率。
+   *
+   * 失败兜底：返回 null（不写入 summary chunk，不影响主流程）
+   * 输入过长处理：截断到 4000 字符（MiniMax 输入上限安全值）
+   */
+  private async generateDocumentSummary(
+    rawText: string,
+    fileName: string,
+  ): Promise<string | null> {
+    try {
+      // 截断到 4000 字符，避免超出 LLM 输入上限或浪费 token
+      const textForSummary = rawText.length > 4000 ? rawText.slice(0, 4000) + '...' : rawText
+      const prompt = `你是文档摘要助手。请用 300-500 字中文总结以下文档的核心内容，包括主题、关键概念、覆盖范围。
+不要逐字复述，要让读者通过摘要能大致了解文档讲什么、适合回答哪类问题。
+直接输出摘要内容，不要用"本文..."等开头，不要带标题。
+
+文件名：${fileName}
+文档内容：
+${textForSummary}`
+      // 非流式调用：ChatOpenAI.invoke() 会等完整响应返回
+      const response: any = await this.llm.invoke(prompt)
+      const summary = (typeof response?.content === 'string' ? response.content : String(response?.content || '')).trim()
+      if (!summary) return null
+      this.logger.log(`[P3-3 摘要] 文档摘要生成成功: ${fileName} → ${summary.length} 字`)
+      return summary
+    } catch (err: any) {
+      this.logger.warn(`[P3-3 摘要] LLM 调用失败: ${err?.message || err}（跳过摘要写入）`)
+      return null
+    }
+  }
+
+  /**
+   * Sheet 摘要：把 sheet 的列名 + 前 5 行数据喂给 LLM，生成 200-300 字中文摘要。
+   * 用于 SQL 轨道每个 sheet 的"全局视图"，跨段落/跨行召回。
+   *
+   * 失败兜底：返回 null
+   */
+  private async generateSheetSummary(
+    sheetName: string,
+    columns: string[],
+    rowObjects: Record<string, unknown>[],
+  ): Promise<string | null> {
+    try {
+      // 取前 5 行作为样本（更多行超出 LLM 输入限制）
+      const sampleRows = rowObjects.slice(0, 5)
+      const sampleText = sampleRows
+        .map((row, i) => {
+          const kvs = Object.entries(row)
+            .filter(([_, v]) => v !== null && v !== undefined && (typeof v !== 'string' || v.trim() !== ''))
+            .map(([k, v]) => `${k}=${v}`)
+            .join('；')
+          return `行${i + 1}: ${kvs}`
+        })
+        .join('\n')
+      const prompt = `你是表格摘要助手。请用 200-300 字中文总结以下 Excel/CSV sheet 的核心信息，包括：
+- 这个 sheet 主要记录什么类型的数据
+- 列名含义（用中文解释每个列名是关于什么的）
+- 数据范围或示例（前 5 行示例即可）
+直接输出摘要内容，不要用"本表..."等开头。
+
+Sheet 名：${sheetName}
+列名：${columns.join('、')}
+前 5 行示例：
+${sampleText}`
+      const response: any = await this.llm.invoke(prompt)
+      const summary = (typeof response?.content === 'string' ? response.content : String(response?.content || '')).trim()
+      if (!summary) return null
+      this.logger.log(`[P3-3 摘要] sheet 摘要生成成功: ${sheetName} → ${summary.length} 字`)
+      return summary
+    } catch (err: any) {
+      this.logger.warn(`[P3-3 摘要] sheet LLM 调用失败: ${err?.message || err}（跳过摘要写入）`)
+      return null
+    }
+  }
+
+  // ============================================================================
+  // ❓【P3-4】LLM 为每个 chunk 生成"用户可能问的问题"作为辅助检索点
+  // ============================================================================
+
+  /**
+   * 给定一个文本 chunk，调 LLM 生成 3-5 个"用户可能问的问题"。
+   * 这些问题作为辅助 chunk 写入 Qdrant，召回时"用户问题 ↔ 辅助问题"匹配
+   * 比"用户问题 ↔ 原文文本"匹配更精准。
+   *
+   * 失败兜底：返回 []（不写入 FAQ chunk，不影响主流程）
+   * 超短 chunk：直接返回 []（chunk 太短，没有 FAQ 价值）
+   * 超时控制：单次 LLM 调用 > 20s 自动 abort，避免 ETL 整体 hang
+   */
+  private async generateChunkFAQs(chunkText: string, contextHint: string = ''): Promise<string[]> {
+    // 超短 chunk（如摘要）跳过 FAQ 生成
+    if (chunkText.length < 100) return []
+    try {
+      const hintPart = contextHint ? `\n（上下文：${contextHint}）` : ''
+      const prompt = `你是 RAG 检索优化助手。以下是一段知识库文档片段${hintPart}，请基于它的内容生成 3-5 个"用户最可能问的问题"。
+要求：
+1. 问题必须能从该片段直接找到答案，不要问片段外的扩展内容
+2. 问题表述要自然，符合真实用户提问习惯（不要机械的"什么是 X"句式）
+3. 每行一个问题，不要编号，不要其他解释
+
+文档片段：
+${chunkText.slice(0, 1500)}`
+      // 单次 LLM 调用限时 20s
+      const response: any = await Promise.race([
+        this.llm.invoke(prompt),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('FAQ 生成超时 20s')), 20000)),
+      ])
+      const raw = (typeof response?.content === 'string' ? response.content : String(response?.content || '')).trim()
+      if (!raw) return []
+      // 按行拆分，去空 + 去编号（如"1." "1、"）
+      const faqs = raw
+        .split('\n')
+        .map((q: string) => q.replace(/^\s*\d+[.、)]\s*/, '').trim())
+        .filter((q: string) => q.length > 0 && q.length < 200 && !q.startsWith('问题'))
+      return faqs.slice(0, 5) // 最多 5 个
+    } catch (err: any) {
+      this.logger.warn(`[P3-4 FAQ] LLM 调用失败: ${err?.message || err}（跳过该 chunk 的 FAQ）`)
+      return []
+    }
   }
 
   // ============================================================================
@@ -440,6 +737,37 @@ export class RagService {
       parts.push(`${key}: ${this.stringifyCellValue(value)}`)
     }
     return parts.join('; ')
+  }
+
+  /**
+   * 【P3-2】行级自然语言化：把单行 Excel/CSV 转成"带语义上下文的完整段落"。
+   *
+   * 输入示例：
+   *   row = { 部门: '研发', 人数: 42, 月份: '2025-03' }
+   *   sheetName = '员工统计'
+   *   rowIndex = 3
+   *
+   * 输出：
+   *   【员工统计】第 3 行：部门 = 研发；人数 = 42；月份 = 2025-03
+   *
+   * 与旧版 serializeRowAsText 区别：
+   *   - 加了 sheet 标题前缀 + 行号定位
+   *   - 用 " = " 分隔键值（vs 旧的 ": "），让 LLM 更明确"键值对"语义
+   *   - 整行一句话，便于客户端提问"研发部门多少人"时直接命中整段
+   */
+  private serializeRowAsNaturalLanguage(
+    row: Record<string, unknown>,
+    sheetName: string,
+    rowIndex: number,
+  ): string {
+    const parts: string[] = []
+    for (const [key, value] of Object.entries(row)) {
+      if (value === null || value === undefined) continue
+      if (typeof value === 'string' && value.trim() === '') continue
+      parts.push(`${key} = ${this.stringifyCellValue(value)}`)
+    }
+    const kv = parts.join('；')
+    return `【${sheetName}】第 ${rowIndex} 行：${kv}`
   }
 
   /**
@@ -499,14 +827,17 @@ export class RagService {
   /**
    * 解析 Excel（多 sheet）→ 行级 Document[]
    * 走 ExcelJS（流式 + 保留单元格类型 + 多 sheet 友好）
+   *
+   * 【P3-2】返回值改为 rowObjects（原始对象数组），不再预序列化为 KV 字符串；
+   * 自然语言化在 parseStructuredToVectorStore 里做（带 sheet 标题 + 行号上下文）
    */
   private async parseExcelRows(
     file: Express.Multer.File,
-  ): Promise<{ sheetName: string; columns: string[]; rowTexts: string[] }[]> {
+  ): Promise<{ sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[]> {
     const workbook = new ExcelJS.Workbook()
     // multer 的 buffer 是 Buffer<ArrayBufferLike>，ExcelJS 期望 Node 旧版 Buffer，转 any 绕过 TS 5.7+ 泛型差异
     await workbook.xlsx.load(file.buffer as any)
-    const result: { sheetName: string; columns: string[]; rowTexts: string[] }[] = []
+    const result: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[] = []
 
     workbook.eachSheet((worksheet) => {
       const sheetName = worksheet.name || 'Sheet'
@@ -528,8 +859,8 @@ export class RagService {
         rawColumns.push(colName)
       }
 
-      // 遍历 data row（第 2 行起）
-      const rowTexts: string[] = []
+      // 遍历 data row（第 2 行起）→ rowObjects[i] 对应 sheet 的第 i+2 行
+      const rowObjects: Record<string, unknown>[] = []
       for (let r = 2; r <= worksheet.rowCount; r++) {
         const dataRow = worksheet.getRow(r)
         const obj: Record<string, unknown> = {}
@@ -549,13 +880,11 @@ export class RagService {
             hasAnyValue = true
           }
         }
-        if (!hasAnyValue) continue
-        const text = this.serializeRowAsText(obj)
-        if (text) rowTexts.push(text)
+        if (hasAnyValue) rowObjects.push(obj)
       }
 
-      if (rowTexts.length > 0) {
-        result.push({ sheetName, columns: rawColumns, rowTexts })
+      if (rowObjects.length > 0) {
+        result.push({ sheetName, columns: rawColumns, rowObjects })
       }
     })
 
@@ -569,7 +898,9 @@ export class RagService {
    * 解析 CSV（xlsx 库同样支持）→ 行级 Document[]
    * 只取第一个 sheet（CSV 本就是单表）
    */
-  private parseCsvRows(file: Express.Multer.File): { sheetName: string; columns: string[]; rowTexts: string[] }[] {
+  private parseCsvRows(
+    file: Express.Multer.File,
+  ): { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[] {
     // file.buffer 是 Buffer<ArrayBufferLike>，而 xlsx 期望 Node 旧版 Buffer。
     // multer 的 buffer 本质是同一段 ArrayBuffer，转一道 any 绕过 TS 5.7+ Buffer 泛型差异。
     const wb = XLSX.read(file.buffer as any, { type: 'buffer' })
@@ -582,20 +913,24 @@ export class RagService {
     // 列名从第一行 keys 取，空名 fallback col_N
     const firstRow = rows[0] || {}
     const columns = Object.keys(firstRow).map((k, i) => (k && k.trim() ? k.trim() : `col_${i + 1}`))
-    const rowTexts: string[] = []
-    for (const r of rows) {
-      const text = this.serializeRowAsText(r)
-      if (text) rowTexts.push(text)
-    }
-    if (rowTexts.length === 0) throw new Error('CSV 文件未解析到任何有效行（全部为空）')
-    return [{ sheetName: firstSheetName, columns, rowTexts }]
+    // 【P3-2】保留原始对象数组，不再预序列化为 KV 字符串；自然语言化在 parseStructuredToVectorStore 里做
+    const rowObjects = rows.filter((r) => {
+      // 过滤全空行
+      return Object.values(r).some((v) => v !== null && v !== undefined && (typeof v !== 'string' || v.trim() !== ''))
+    })
+    if (rowObjects.length === 0) throw new Error('CSV 文件未解析到任何有效行（全部为空）')
+    return [{ sheetName: firstSheetName, columns, rowObjects }]
   }
 
   /**
    * 结构化文件 → 行级 chunk → Embedding → Qdrant
-   * - 单一文件多 sheet（Excel）→ 每个 sheet 独立行级 chunk
-   * - 每个 chunk 聚合 ~3 行（按 chunkSize 600 / overlap 100 走 RecursiveCharacterTextSplitter）
-   * - metadata 加 ragTrack='sql' + sheetName + 聚合的 rowIndices 区间
+   *
+   * 【P3-2】每行一个 chunk，不再用 splitter 跨越行边界切：
+   *   - 每个 chunk 是"【Sheet名】第 N 行：列1 = 值1；列2 = 值2..." 完整自然语言段落
+   *   - metadata.rowIndices 精确到该行（不再是全 sheet 行号列表）
+   *   - 召回后 LLM 看到的不是"列名:列名"重复，而是完整的行级描述
+   *
+   * 行内容过长（> 800 字符）的兜底：用 splitter 按句号/分号切多段，每段继承 rowIndices
    */
   private async parseStructuredToVectorStore(
     file: Express.Multer.File,
@@ -603,7 +938,7 @@ export class RagService {
     originalName: string,
   ): Promise<void> {
     const ext = path.extname(originalName).toLowerCase()
-    let sheets: { sheetName: string; columns: string[]; rowTexts: string[] }[]
+    let sheets: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[]
 
     if (ext === '.csv') {
       sheets = this.parseCsvRows(file)
@@ -612,23 +947,22 @@ export class RagService {
       sheets = await this.parseExcelRows(file)
     }
 
-    const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 600, chunkOverlap: 100 })
     const documents: Document[] = []
     let globalChunkIdx = 0
+    // 兜底 splitter：单行内容 > 800 字符时按句号/分号切，避免超长 chunk 拉低 embedding 质量
+    const longRowSplitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 800,
+      chunkOverlap: 0,
+      separators: ['。', '；', '\n', ' ', ''],
+    })
 
-    for (const { sheetName, columns, rowTexts } of sheets) {
-      // rowTexts[i] 对应原始 sheet 的"第 i + 2 行"（第 1 行是表头）
-      const chunks = await splitter.splitText(rowTexts.join('\n'))
-      // 用 splitText 后无法直接知道每段覆盖了哪些 row，改用 splitText 的返回+二次切分？
-      // ——这里走"按 splitter 切完后对每段用行号回填"策略不准确。
-      // 退而求其次：每段 metadata 里记录 sheetName + 该 sheet 全部行号（轻量、可追溯），
-      // 召回后由 LLM + sheetName 协作定位。
-      // ⚠️ originalName 已经被 asyncProcessEtlPipeline 在上游做过 latin1→utf8 解码，
-      // 这里不要再解！直接用 originalName，否则会被"二次解码"重新打回乱码。
-      for (let i = 0; i < chunks.length; i++) {
+    for (const { sheetName, columns, rowObjects } of sheets) {
+      // 【P3-3】先调 LLM 生成该 sheet 摘要，作为额外首 chunk
+      const sheetSummary = await this.generateSheetSummary(sheetName, columns, rowObjects)
+      if (sheetSummary) {
         documents.push(
           new Document({
-            pageContent: chunks[i],
+            pageContent: `【${sheetName} 摘要】${sheetSummary}`,
             metadata: {
               fileId,
               fileName: originalName,
@@ -636,12 +970,76 @@ export class RagService {
               ragTrack: 'sql',
               sheetName,
               columns,
-              // 行级 rowIndex 列表（覆盖整个 sheet 的所有有效行）—— 召回时可回填精确行号
-              rowIndices: rowTexts.map((_, idx) => idx + 2),
+              rowIndices: [], // 摘要不绑具体行号
+              chunkType: 'summary',
             },
           }),
         )
       }
+      // rowObjects[i] 对应原始 sheet 的"第 i + 2 行"（第 1 行是表头）
+      const rowChunkIndices: number[] = [] // 记录每个 row 的 chunkIndex，供 FAQ 反向引用
+      for (let i = 0; i < rowObjects.length; i++) {
+        const rowIndex = i + 2
+        const rowText = this.serializeRowAsNaturalLanguage(rowObjects[i], sheetName, rowIndex)
+        // 短行直接 1 chunk；超长行兜底切
+        const subChunks =
+          rowText.length <= 800 ? [rowText] : await longRowSplitter.splitText(rowText)
+        for (const sub of subChunks) {
+          const thisIdx = globalChunkIdx++
+          documents.push(
+            new Document({
+              pageContent: sub,
+              metadata: {
+                fileId,
+                fileName: originalName,
+                chunkIndex: thisIdx,
+                ragTrack: 'sql',
+                sheetName,
+                columns,
+                // 【P3-2】精确行号（单行；超长行兜底切时所有 sub-chunk 都属于该行）
+                rowIndices: [rowIndex],
+              },
+            }),
+          )
+          if (subChunks.length === 1) rowChunkIndices.push(thisIdx) // 仅"1 行 = 1 chunk"时记录
+        }
+      }
+
+      // 【P3-4】为每个"行级 chunk"生成 FAQ 辅助检索点
+      // SQL 轨道每行都是结构化事实，FAQ 问题可以更具体（如"研发部门多少人"）
+      // 每行生成 FAQ 让用户能用自然语言问题精准命中
+      // 数量限制：每个 sheet 最多 5 个 FAQ（覆盖核心行）
+      const sqlOriginalCount = documents.length
+      let sqlFaqCount = 0
+      const MAX_FAQ_PER_SHEET = 5
+      for (const doc of documents) {
+        if (sqlFaqCount >= MAX_FAQ_PER_SHEET) break
+        if ((doc.metadata as any)?.chunkType) continue // 跳过已有 chunkType 的（如 summary）
+        const faqs = await this.generateChunkFAQs(
+          doc.pageContent,
+          `${originalName} / ${(doc.metadata as any)?.sheetName}`,
+        )
+        if (faqs.length === 0) continue
+        documents.push(
+          new Document({
+            pageContent: `【FAQ】${faqs.join('\n')}`,
+            metadata: {
+              fileId,
+              fileName: originalName,
+              chunkIndex: (doc.metadata as any)?.chunkIndex ?? globalChunkIdx++,
+              ragTrack: 'sql',
+              sheetName: (doc.metadata as any)?.sheetName,
+              columns: (doc.metadata as any)?.columns,
+              rowIndices: (doc.metadata as any)?.rowIndices ?? [],
+              chunkType: 'faq',
+            },
+          }),
+        )
+        sqlFaqCount++
+      }
+      this.logger.log(
+        `[P3-4 FAQ] fileId=${fileId} sheet=${sheetName} 生成 ${documents.length - sqlOriginalCount} 条 FAQ 辅助 chunks`,
+      )
     }
 
     if (documents.length === 0) {
@@ -657,7 +1055,9 @@ export class RagService {
       collectionName: this.collectionName,
     })
 
-    this.logger.log(`[SQL轨道] fileId=${fileId} 完成行级向量化：${sheets.length} sheet / ${documents.length} chunk`)
+    this.logger.log(
+      `[SQL轨道] fileId=${fileId} 完成行级向量化：${sheets.length} sheet / ${sheets.reduce((acc, s) => acc + s.rowObjects.length, 0)} 行 / ${documents.length} chunk`,
+    )
   }
 
   /**

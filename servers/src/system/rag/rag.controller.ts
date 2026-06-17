@@ -102,6 +102,9 @@ export class RagController {
           cb(null, finalName)
         },
       }),
+      // 【P3-5】文件大小上限 50MB，防止 OOM/磁盘占满；
+      // 超限后 multer 抛 MulterError('LIMIT_FILE_SIZE')，controller 层不重启
+      limits: { fileSize: 50 * 1024 * 1024 },
     }),
   )
   @ApiOperation({ summary: '上传并注册语料文件资产' })
@@ -137,6 +140,23 @@ export class RagController {
     }
     await this.ragService.deleteFileEntity(Number(id))
     return ResultData.ok(null, '该项语料资产已完成安全下线与销毁')
+  }
+
+  // ============================================================================
+  // 🔁【P3-5】ETL 重试：FAILED 状态的资产可手动重跑 ETL（不重新上传文件）
+  // ============================================================================
+
+  @Post('file/retry')
+  @ApiOperation({ summary: '重跑 ETL（文件已上传但 ETL 失败时使用）' })
+  async retryEtl(@Req() req: any, @Query('id') id: string) {
+    if (!req.user || req.user.type !== UserType.SUPER_ADMIN) {
+      return ResultData.fail(HttpStatus.FORBIDDEN, '核心资产仅限管理员操作')
+    }
+    const result = await this.ragService.retryFailedEtl(Number(id))
+    if (!result.ok) {
+      return ResultData.fail(HttpStatus.BAD_REQUEST, result.reason || '重试失败')
+    }
+    return ResultData.ok(null, 'ETL 重试已加入队列')
   }
 
   // ============================================================================
