@@ -184,9 +184,6 @@ export class RagService {
   private readonly embeddings: MiniMaxEmbeddings
   private readonly qdrantUrl: string
   private readonly collectionName: string
-  // 【P3-5】ETL 并发控制：最多同时跑 3 个 ETL，超出排队等待
-  // 防止大量并发上传击穿 embedding API 或 Qdrant
-  private readonly etlSemaphore = new SimpleSemaphore(3)
 
   constructor(
     @InjectRepository(RagFileEntity)
@@ -362,20 +359,17 @@ export class RagService {
    * @param fileId       数据库中的文件 id
    * @param originalName 原始文件名（用于在 metadata 保留）
    */
-  async asyncProcessEtlPipeline(
+  async runEtlJob(
     filePath: string,
     fileId: number,
     originalName: string,
-    userId: number, // 【P0-1】透传 userId，用于 Qdrant metadata 写隔离
+    userId: number,
   ): Promise<void> {
-    // 【P3-5】并发控制：超过 3 个并发时排队等待；并发日志方便排查
-    await this.etlSemaphore.acquire()
-    this.logger.log(
-      `[P3-5 ETL 启动] fileId=${fileId} 当前并发=${this.etlSemaphore.active}, 排队=${this.etlSemaphore.waiting}`,
-    )
-    // 【P3-5】ETL 计时埋点：从排队到完成的端到端耗时
+    // 【P1-2】BullMQ 队列已处理并发控制（concurrency=3）
+    // 【P1-1】ETL 计时埋点
     const t0 = Date.now()
-    let hasError = false // 【P1-1】finally 用此标志上报 ETL 成功/失败
+    let hasError = false
+    this.logger.log(`[P1-2 ETL 启动] fileId=${fileId} userId=${userId}`)
     try {
       const record = await this.ragFileRepository.findOneBy({ id: fileId })
       if (!record) return
@@ -418,15 +412,10 @@ export class RagService {
         errorMessage: stackFirstLine ? `${msg} | ${stackFirstLine}` : msg,
       })
     } finally {
-      // 【P3-5】无论成功/失败/异常，必须释放信号量 + 记录耗时
+      // 【P1-1】无论成功/失败/异常，上报 Prometheus 指标
       const durationMs = Date.now() - t0
-      this.logger.log(
-        `[P3-5 ETL 完成] fileId=${fileId} 耗时=${durationMs}ms (并发=${this.etlSemaphore.active}, 排队=${this.etlSemaphore.waiting})`,
-      )
-      // 【P1-1】上报 Prometheus 指标
+      this.logger.log(`[P1-2 ETL 完成] fileId=${fileId} 耗时=${durationMs}ms`)
       this.metrics.recordEtlComplete(hasError ? 'failed' : 'success', durationMs / 1000)
-      this.metrics.setQueueDepth(this.etlSemaphore.active, this.etlSemaphore.waiting)
-      this.etlSemaphore.release()
     }
   }
 
@@ -440,7 +429,7 @@ export class RagService {
     fileId: number,
     userId: number,
     isSuperAdmin: boolean,
-  ): Promise<{ ok: boolean; reason?: string }> {
+  ): Promise<{ ok: boolean; reason?: string; filePath?: string; fileName?: string }> {
     // 【P0-1】先用 getOwnedFile 校验归属（超管跳过）
     const record = await this.getOwnedFile(fileId, userId, isSuperAdmin)
     if (!record) return { ok: false, reason: '文件不存在或无权访问' }
@@ -474,11 +463,8 @@ export class RagService {
     } catch (err: any) {
       this.logger.warn(`[P0-1 重试清理] 清旧 chunks 失败（不阻断重跑）fileId=${fileId} ${err?.message || err}`)
     }
-    // fire-and-forget 调用 ETL（与 upload 接口一致行为）
-    this.asyncProcessEtlPipeline(filePath, fileId, record.fileName, record.userId).catch((err) => {
-      this.logger.error(`[P3-5 重试 ETL 异步管道崩溃] fileId=${fileId} ${err?.stack || err}`)
-    })
-    return { ok: true }
+    // 【P1-2】不再 fire-and-forget 直接调 ETL —— 由 controller 推 BullMQ 队列
+    return { ok: true, filePath, fileName: record.fileName }
   }
 
   /**

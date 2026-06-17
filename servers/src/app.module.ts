@@ -14,6 +14,7 @@ import { JwtAuthGuard } from './common/guards/auth.guard'
 import { RolesGuard } from './common/guards/roles.guard'
 import { HealthModule } from './common/health/health.module'
 import { MetricsModule } from './common/metrics/metrics.module'
+import { BullModule } from '@nestjs/bullmq'
 
 import { UserModule } from './system/user/user.module'
 import { AuthModule } from './system/auth/auth.module'
@@ -92,6 +93,14 @@ import { RagModule } from './system/rag/rag.module'
     HealthModule,
     // 【P1-1】RAG 业务指标（RagMetricsService 全局可见）
     MetricsModule,
+    // 【P1-2】BullMQ 全局队列：ETL 任务持久化 + 重试策略 + 并发控制（替代 SimpleSemaphore）
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        connection: config.get<any>('redis'),
+      }),
+    }),
     // 系统基础模块
     UserModule,
     AuthModule,

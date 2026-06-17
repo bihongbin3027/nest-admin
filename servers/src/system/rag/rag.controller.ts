@@ -30,6 +30,9 @@ import { ResultData } from '../../common/utils/result'
 import { Keep } from '../../common/decorators/keep.decorator'
 import { RAG_UPLOAD_DIR } from './rag-upload.util'
 import { AuditInterceptor } from '../audit/audit.interceptor'
+import { InjectQueue } from '@nestjs/bullmq'
+import { Queue } from 'bullmq'
+import { RAG_ETL_QUEUE_NAME, RAG_ETL_JOB_RUN, RagEtlJobData } from './rag-etl.constants'
 
 @ApiTags('企业级双轨制核心知识库 RAG')
 @ApiBearerAuth()
@@ -40,10 +43,11 @@ export class RagController {
   // 上传根目录用模块顶层 RAG_UPLOAD_DIR 常量（@UseInterceptors 装饰器先于构造函数求值，必须顶层可用）
   private readonly serveRoot: string
   private readonly fileDomain: string
-
+  // 【P1-2】BullMQ ETL 队列（持久化 + 自动重试 + 并发控制 concurrency=3）
   constructor(
     private readonly ragService: RagService,
     private readonly config: ConfigService,
+    @InjectQueue(RAG_ETL_QUEUE_NAME) private readonly etlQueue: Queue<RagEtlJobData>,
   ) {
     this.serveRoot = this.config.get<string>('app.file.serveRoot') || ''
     this.fileDomain = this.config.get<string>('app.file.domain') || ''
@@ -155,8 +159,11 @@ export class RagController {
       this.serveRoot,
       this.fileDomain,
     )
-    // ETL 管道从磁盘读（不依赖 buffer）
-    this.ragService.asyncProcessEtlPipeline(file.path, record.id, file.originalname, userId)
+    // 【P1-2】ETL 任务入队（持久化 + 自动重试 + 并发控制由 BullMQ 处理）
+    await this.etlQueue.add(
+      RAG_ETL_JOB_RUN,
+      { filePath: file.path, fileId: record.id, originalName: file.originalname, userId },
+    )
     return ResultData.ok(record, '文件接收成功，异步清洗任务已激活')
   }
 
@@ -194,6 +201,16 @@ export class RagController {
     if (!result.ok) {
       return ResultData.fail(HttpStatus.BAD_REQUEST, result.reason || '重试失败')
     }
+    // 【P1-2】service 完成"准备"（状态重置 + 清旧 chunks）后，controller 推队列触发实际 ETL
+    await this.etlQueue.add(
+      RAG_ETL_JOB_RUN,
+      {
+        filePath: result.filePath,
+        fileId: Number(id),
+        originalName: result.fileName,
+        userId,
+      },
+    )
     return ResultData.ok(null, 'ETL 重试已加入队列')
   }
 
