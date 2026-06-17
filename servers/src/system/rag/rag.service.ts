@@ -20,6 +20,7 @@ import { RagSessionEntity } from './rag-session.entity'
 import { RagMessageEntity } from './rag-message.entity'
 import { ResultData } from '../../common/utils/result'
 import { RAG_UPLOAD_DIR } from './rag-upload.util'
+import { RagMetricsService } from '../../common/metrics/rag-metrics.service'
 
 /**
  * 【P1-2 / P1-3】引用源条目
@@ -195,6 +196,7 @@ export class RagService {
     @InjectRepository(RagMessageEntity)
     private readonly ragMessageRepository: Repository<RagMessageEntity>,
     private readonly configService: ConfigService,
+    private readonly metrics: RagMetricsService, // 【P1-1】Prometheus 指标
   ) {
     const apiKey = this.configService.get<string>('ai.llm.apiKey')
     const baseURL = this.configService.get<string>('ai.llm.baseURL')
@@ -373,6 +375,7 @@ export class RagService {
     )
     // 【P3-5】ETL 计时埋点：从排队到完成的端到端耗时
     const t0 = Date.now()
+    let hasError = false // 【P1-1】finally 用此标志上报 ETL 成功/失败
     try {
       const record = await this.ragFileRepository.findOneBy({ id: fileId })
       if (!record) return
@@ -404,6 +407,7 @@ export class RagService {
 
       await this.ragFileRepository.update(fileId, { vectorStatus: VectorStatusEnum.SUCCESS })
     } catch (error: any) {
+      hasError = true
       this.logger.error(`[RAG ETL 异步管道崩溃] FILE_ID: ${fileId}\n${error?.stack || error}`)
       // 把堆栈首行也存到 errorMessage，方便页面直接看到崩溃位置
       const stackFirstLine =
@@ -419,6 +423,9 @@ export class RagService {
       this.logger.log(
         `[P3-5 ETL 完成] fileId=${fileId} 耗时=${durationMs}ms (并发=${this.etlSemaphore.active}, 排队=${this.etlSemaphore.waiting})`,
       )
+      // 【P1-1】上报 Prometheus 指标
+      this.metrics.recordEtlComplete(hasError ? 'failed' : 'success', durationMs / 1000)
+      this.metrics.setQueueDepth(this.etlSemaphore.active, this.etlSemaphore.waiting)
       this.etlSemaphore.release()
     }
   }
@@ -1490,9 +1497,13 @@ ${chunkText.slice(0, 1500)}`
         }
       }
       const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
+      // 【P1-1】上报向量检索指标 + top-1 相似度
+      const topScore = raw.length > 0 ? raw[0][1] : null
+      this.metrics.recordVectorSearch(topScore)
       return raw.map(([doc, score]) => ({ doc, score }))
     } catch (vErr) {
       this.logger.error('[Qdrant 相似度检索失败]', vErr as any)
+      this.metrics.recordEmbeddingError('embedQuery') // Qdrant 失败一并记入
       return []
     }
   }

@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config'
 import { TypeOrmModule, TypeOrmModuleOptions } from '@nestjs/typeorm'
 import { ServeStaticModule, ServeStaticModuleOptions } from '@nestjs/serve-static'
 import { APP_GUARD } from '@nestjs/core'
+import { PrometheusModule } from '@willsoto/nestjs-prometheus'
 import path from 'path'
 
 import configuration from './config/index'
@@ -11,6 +12,8 @@ import { RedisOptions } from 'ioredis'
 import { RedisModule } from './common/libs/redis/redis.module'
 import { JwtAuthGuard } from './common/guards/auth.guard'
 import { RolesGuard } from './common/guards/roles.guard'
+import { HealthModule } from './common/health/health.module'
+import { MetricsModule } from './common/metrics/metrics.module'
 
 import { UserModule } from './system/user/user.module'
 import { AuthModule } from './system/auth/auth.module'
@@ -79,6 +82,16 @@ import { RagModule } from './system/rag/rag.module'
       },
       true,
     ),
+    // 【P1-1】Prometheus 指标抓取端点 /metrics（默认启用 HTTP 请求时长等基础指标）
+    // path 必须配在 JwtAuthGuard 之外，否则需要 token 才能抓指标
+    PrometheusModule.register({
+      path: '/metrics',
+      defaultMetrics: { enabled: true },
+    }),
+    // 【P1-1】健康检查端点 /health / health/live / health/ready
+    HealthModule,
+    // 【P1-1】RAG 业务指标（RagMetricsService 全局可见）
+    MetricsModule,
     // 系统基础模块
     UserModule,
     AuthModule,

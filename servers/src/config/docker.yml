@@ -51,6 +51,11 @@ perm:
         { path: "/api/login", method: "POST" },
         { path: "/api/perm/:id", method: "GET" },
         { path: "/api/oss/upload", method: "POST" },
+        # 【P1-1】监控端点免登录：Prometheus 抓取 / k8s 探针
+        { path: "/api/metrics", method: "GET" },
+        { path: "/api/health", method: "GET" },
+        { path: "/api/health/live", method: "GET" },
+        { path: "/api/health/ready", method: "GET" },
       ]
 
 # 用户相关
