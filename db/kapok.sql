@@ -311,6 +311,7 @@ INSERT INTO `sys_user_role` VALUES (34, 2, 1);
 -- ----------------------------
 CREATE TABLE `sys_rag_file` (
   `id` int NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  `user_id` int NOT NULL DEFAULT '1' COMMENT '所属用户ID（1=SUPER_ADMIN 默认兜底，企业 SaaS 红线：按用户隔离文件）',
   `fileName` varchar(255) NOT NULL COMMENT '文件/文件夹名称',
   `parentId` int NOT NULL DEFAULT '0' COMMENT '父级ID，0代表根目录',
   `isFolder` tinyint NOT NULL DEFAULT '0' COMMENT '是否为文件夹：0否，1是',
@@ -323,7 +324,8 @@ CREATE TABLE `sys_rag_file` (
   `createdAt` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '创建时间',
   `updatedAt` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新时间',
   PRIMARY KEY (`id`),
-  KEY `IDX_PARENT_ID` (`parentId`) COMMENT '加快层级目录检索速度'
+  KEY `IDX_PARENT_ID` (`parentId`) COMMENT '加快层级目录检索速度',
+  KEY `IDX_RAG_FILE_USER` (`user_id`, `parentId`) COMMENT '按用户隔离文件："我的目录下文件"最高频查询 O(log n)'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='企业级双轨制核心知识库资产表';
 
 -- ----------------------------

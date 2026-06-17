@@ -57,6 +57,11 @@ export class RagController {
     return Number.isFinite(num) ? num : null
   }
 
+  // 【P0-1】超管识别：超管绕过 userId 过滤，可看/操作所有用户文件
+  private isSuperAdmin(req: any): boolean {
+    return req.user?.type === UserType.SUPER_ADMIN
+  }
+
   // ============================================================================
   // 📂 知识库资产 CRUD
   // ============================================================================
@@ -64,8 +69,15 @@ export class RagController {
   @Get('files/list')
   @AllowNoPerm()
   @ApiOperation({ summary: '查询虚拟隔离仓 file 列表' })
-  async getFileList(@Query('parentId') parentId: string) {
-    const files = await this.ragService.getKnowledgeFileList(Number(parentId) || 0)
+  async getFileList(@Req() req: any, @Query('parentId') parentId: string) {
+    // 【P0-1】按 userId 过滤，超管跳过
+    const userId = this.resolveUserId(req)
+    if (userId === null) return ResultData.fail(HttpStatus.UNAUTHORIZED, '未识别到用户身份')
+    const files = await this.ragService.getKnowledgeFileList(
+      Number(parentId) || 0,
+      userId,
+      this.isSuperAdmin(req),
+    )
     // 🔧 后端 size 字段是 bigint，TypeORM 默认以 string 返回 JS 端避免精度丢失；
     // 前端 RagAssetItem.size 类型是 number（formatSize 内部走 Math.log 字符串隐式转 number 不可靠），
     // 这里显式转 number 一次，让前端格式化逻辑稳。
@@ -76,10 +88,10 @@ export class RagController {
   @Post('folder/create')
   @ApiOperation({ summary: '创建虚拟知识文件夹' })
   async createFolder(@Req() req: any, @Body() dto: { name: string; parentId: number }) {
-    if (!req.user || req.user.type !== UserType.SUPER_ADMIN) {
-      return ResultData.fail(HttpStatus.FORBIDDEN, '权限不足：仅管理员可创建目录')
-    }
-    const result = await this.ragService.createFolder(dto.name, Number(dto.parentId) || 0)
+    // 【P0-1】仅要求登录用户即可创建自己的目录（不再硬性 admin-only）
+    const userId = this.resolveUserId(req)
+    if (userId === null) return ResultData.fail(HttpStatus.UNAUTHORIZED, '未识别到用户身份')
+    const result = await this.ragService.createFolder(dto.name, Number(dto.parentId) || 0, userId)
     return ResultData.ok(result)
   }
 
@@ -113,9 +125,9 @@ export class RagController {
     @UploadedFile() file: Express.Multer.File,
     @Body('parentId') parentId: string,
   ) {
-    if (!req.user || req.user.type !== UserType.SUPER_ADMIN) {
-      return ResultData.fail(HttpStatus.FORBIDDEN, '权限不足：仅管理员可上传')
-    }
+    // 【P0-1】仅要求登录用户即可上传自己文件（不再硬性 admin-only）
+    const userId = this.resolveUserId(req)
+    if (userId === null) return ResultData.fail(HttpStatus.UNAUTHORIZED, '未识别到用户身份')
     if (!file) {
       return ResultData.fail(HttpStatus.BAD_REQUEST, '未检测到上传文件流')
     }
@@ -124,22 +136,29 @@ export class RagController {
     const record = await this.ragService.registerPhysicalFile(
       file,
       Number(parentId) || 0,
+      userId,
       this.serveRoot,
       this.fileDomain,
     )
     // ETL 管道从磁盘读（不依赖 buffer）
-    this.ragService.asyncProcessEtlPipeline(file.path, record.id, file.originalname)
+    this.ragService.asyncProcessEtlPipeline(file.path, record.id, file.originalname, userId)
     return ResultData.ok(record, '文件接收成功，异步清洗任务已激活')
   }
 
   @Delete('file/delete')
   @ApiOperation({ summary: '物理擦除知识库资产' })
   async deleteFile(@Req() req: any, @Query('id') id: string) {
-    if (!req.user || req.user.type !== UserType.SUPER_ADMIN) {
-      return ResultData.fail(HttpStatus.FORBIDDEN, '核心资产仅限管理员销毁')
-    }
-    await this.ragService.deleteFileEntity(Number(id))
-    return ResultData.ok(null, '该项语料资产已完成安全下线与销毁')
+    // 【P0-1】任何登录用户都能删自己的文件，超管可删所有
+    const userId = this.resolveUserId(req)
+    if (userId === null) return ResultData.fail(HttpStatus.UNAUTHORIZED, '未识别到用户身份')
+    const result = await this.ragService.deleteFileEntity(
+      Number(id),
+      userId,
+      this.isSuperAdmin(req),
+    )
+    return result.ok
+      ? ResultData.ok(null, '该项语料资产已完成安全下线与销毁')
+      : ResultData.fail(HttpStatus.FORBIDDEN, result.reason || '删除失败')
   }
 
   // ============================================================================
@@ -149,10 +168,14 @@ export class RagController {
   @Post('file/retry')
   @ApiOperation({ summary: '重跑 ETL（文件已上传但 ETL 失败时使用）' })
   async retryEtl(@Req() req: any, @Query('id') id: string) {
-    if (!req.user || req.user.type !== UserType.SUPER_ADMIN) {
-      return ResultData.fail(HttpStatus.FORBIDDEN, '核心资产仅限管理员操作')
-    }
-    const result = await this.ragService.retryFailedEtl(Number(id))
+    // 【P0-1】任何登录用户都能重试自己的文件，超管可重试所有
+    const userId = this.resolveUserId(req)
+    if (userId === null) return ResultData.fail(HttpStatus.UNAUTHORIZED, '未识别到用户身份')
+    const result = await this.ragService.retryFailedEtl(
+      Number(id),
+      userId,
+      this.isSuperAdmin(req),
+    )
     if (!result.ok) {
       return ResultData.fail(HttpStatus.BAD_REQUEST, result.reason || '重试失败')
     }
@@ -167,6 +190,7 @@ export class RagController {
   @AllowNoPerm()
   @ApiOperation({ summary: '拉取 SQL 轨道引用对应的真实行数据（用于预览弹窗渲染迷你表格）' })
   async getStructuredRows(
+    @Req() req: any,
     @Body() dto: { fileId: number; sheetName: string; rowIndices: number[] },
   ) {
     const { fileId, sheetName, rowIndices } = dto || ({} as any)
@@ -177,8 +201,23 @@ export class RagController {
     if (rowIndices.length > 100) {
       return ResultData.fail(HttpStatus.BAD_REQUEST, '单次最多 100 行')
     }
-    const result = await this.ragService.getStructuredRows(fileId, sheetName, rowIndices)
-    return ResultData.ok(result)
+    // 【P0-1】归属校验：用户 A 拿不到用户 B 的 Excel 行数据
+    const userId = this.resolveUserId(req)
+    if (userId === null) return ResultData.fail(HttpStatus.UNAUTHORIZED, '未识别到用户身份')
+    try {
+      const result = await this.ragService.getStructuredRows(
+        fileId,
+        sheetName,
+        rowIndices,
+        userId,
+        this.isSuperAdmin(req),
+      )
+      return ResultData.ok(result)
+    } catch (err: any) {
+      // getStructuredRows 在无权访问时 throw Error('文件不存在或无权访问')
+      const msg = err?.message || '查询失败'
+      return ResultData.fail(HttpStatus.FORBIDDEN, msg)
+    }
   }
 
   // ============================================================================
@@ -279,7 +318,15 @@ export class RagController {
         res.write(`data: ${JSON.stringify(ResultData.fail(401, '未识别到用户身份，请重新登录'))}\n\n`)
         return
       }
-      await this.ragService.executeDualTrackQuery(question, sessionId, sources, res, userId, ac.signal)
+      await this.ragService.executeDualTrackQuery(
+        question,
+        sessionId,
+        sources,
+        res,
+        userId,
+        this.isSuperAdmin(req), // 【P0-1】超管旁路
+        ac.signal,
+      )
     } catch (error) {
       console.error('[RAG Controller 顶层防线捕捉]', error)
       const errorMessage = error instanceof Error ? error.message : '服务器内部发生决策性阻断'

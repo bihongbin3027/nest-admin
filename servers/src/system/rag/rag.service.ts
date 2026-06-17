@@ -200,9 +200,12 @@ export class RagService {
   // 📂 知识库语料 CRUD
   // ============================================================================
 
-  async getKnowledgeFileList(parentId: number): Promise<RagFileEntity[]> {
+  async getKnowledgeFileList(parentId: number, userId: number, isSuperAdmin: boolean): Promise<RagFileEntity[]> {
+    // 【P0-1】超管看所有，普通用户只看自己的；复合索引 (userId, parentId) O(log n)
+    const where: any = { parentId }
+    if (!isSuperAdmin) where.userId = userId
     return await this.ragFileRepository.find({
-      where: { parentId },
+      where,
       order: { isFolder: 'DESC', createdAt: 'DESC' },
     })
   }
@@ -216,13 +219,17 @@ export class RagService {
    *
    * 算法：BFS 一次性查所有直系子节点；目录深度通常 ≤ 3 层，最坏 O(N)。
    * 防御：visited Set 防止 folder 间循环引用导致死循环。
+   *
+   * 【P0-1】加 userId 过滤：用户只能展开"自己的"资产 id，避免跨用户拉取
    */
-  async expandAssetIdsToFileIds(assetIds: number[]): Promise<number[]> {
+  async expandAssetIdsToFileIds(assetIds: number[], userId: number, isSuperAdmin: boolean): Promise<number[]> {
     if (!Array.isArray(assetIds) || assetIds.length === 0) return []
 
-    // 第一步：先分桶（哪些是文件夹，哪些是文件）
+    // 第一步：先分桶（哪些是文件夹，哪些是文件）—— 超管跳过过滤
+    const itemsWhere: any = { id: In(assetIds) }
+    if (!isSuperAdmin) itemsWhere.userId = userId
     const items = await this.ragFileRepository.find({
-      where: { id: In(assetIds) },
+      where: itemsWhere,
       select: ['id', 'isFolder'],
     })
     const fileIdSet = new Set<number>()
@@ -233,15 +240,17 @@ export class RagService {
     }
     if (folderIds.length === 0) return Array.from(fileIdSet)
 
-    // 第二步：BFS 展开所有文件夹的子孙文件
+    // 第二步：BFS 展开所有文件夹的子孙文件 —— 子节点也要按 userId 过滤
     const visited = new Set<number>()
     const queue: number[] = [...folderIds]
     while (queue.length > 0) {
       const currentId = queue.shift()!
       if (visited.has(currentId)) continue
       visited.add(currentId)
+      const childWhere: any = { parentId: currentId }
+      if (!isSuperAdmin) childWhere.userId = userId
       const children = await this.ragFileRepository.find({
-        where: { parentId: currentId },
+        where: childWhere,
         select: ['id', 'isFolder'],
       })
       for (const c of children) {
@@ -252,7 +261,7 @@ export class RagService {
     return Array.from(fileIdSet)
   }
 
-  async createFolder(fileName: string, parentId: number): Promise<RagFileEntity> {
+  async createFolder(fileName: string, parentId: number, userId: number): Promise<RagFileEntity> {
     const folder = this.ragFileRepository.create({
       fileName: fileName,
       parentId: parentId,
@@ -260,6 +269,7 @@ export class RagService {
       vectorStatus: VectorStatusEnum.SUCCESS,
       ragTrack: RagTrackEnum.VECTOR,
       size: 0,
+      userId, // 【P0-1】文件夹归属当前用户
     })
     return await this.ragFileRepository.save(folder)
   }
@@ -288,6 +298,7 @@ export class RagService {
   async registerPhysicalFile(
     file: Express.Multer.File,
     parentId: number,
+    userId: number, // 【P0-1】文件归属当前用户
     serveRoot?: string,
     fileDomain?: string,
   ): Promise<RagFileEntity> {
@@ -317,6 +328,7 @@ export class RagService {
       fileType: ext,
       ragTrack: track,
       vectorStatus: VectorStatusEnum.PROCESSING,
+      userId, // 【P0-1】文件归属当前用户
     })
 
     return await this.ragFileRepository.save(fileEntity)
@@ -336,7 +348,12 @@ export class RagService {
    * @param fileId       数据库中的文件 id
    * @param originalName 原始文件名（用于在 metadata 保留）
    */
-  async asyncProcessEtlPipeline(filePath: string, fileId: number, originalName: string): Promise<void> {
+  async asyncProcessEtlPipeline(
+    filePath: string,
+    fileId: number,
+    originalName: string,
+    userId: number, // 【P0-1】透传 userId，用于 Qdrant metadata 写隔离
+  ): Promise<void> {
     // 【P3-5】并发控制：超过 3 个并发时排队等待；并发日志方便排查
     await this.etlSemaphore.acquire()
     this.logger.log(
@@ -368,9 +385,9 @@ export class RagService {
       }
 
       if (record.ragTrack === RagTrackEnum.SQL) {
-        await this.parseStructuredToVectorStore(file, fileId, safeOriginalName)
+        await this.parseStructuredToVectorStore(file, fileId, safeOriginalName, userId)
       } else {
-        await this.parseDocumentToVectorStore(file, fileId)
+        await this.parseDocumentToVectorStore(file, fileId, userId)
       }
 
       await this.ragFileRepository.update(fileId, { vectorStatus: VectorStatusEnum.SUCCESS })
@@ -400,9 +417,14 @@ export class RagService {
    * 重置 status='processing' 后调用 asyncProcessEtlPipeline（fire-and-forget）。
    * 文件物理路径仍存在于磁盘（RAG_UPLOAD_DIR），不需要重新上传。
    */
-  async retryFailedEtl(fileId: number): Promise<{ ok: boolean; reason?: string }> {
-    const record = await this.ragFileRepository.findOneBy({ id: fileId })
-    if (!record) return { ok: false, reason: '文件不存在' }
+  async retryFailedEtl(
+    fileId: number,
+    userId: number,
+    isSuperAdmin: boolean,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    // 【P0-1】先用 getOwnedFile 校验归属（超管跳过）
+    const record = await this.getOwnedFile(fileId, userId, isSuperAdmin)
+    if (!record) return { ok: false, reason: '文件不存在或无权访问' }
     if (record.isFolder === 1) return { ok: false, reason: '目录不能触发 ETL' }
     if (record.vectorStatus === VectorStatusEnum.PROCESSING) {
       return { ok: false, reason: '该文件 ETL 正在处理中，请等待完成后再试' }
@@ -426,7 +448,7 @@ export class RagService {
       errorMessage: null,
     })
     // fire-and-forget 调用 ETL（与 upload 接口一致行为）
-    this.asyncProcessEtlPipeline(filePath, fileId, record.fileName).catch((err) => {
+    this.asyncProcessEtlPipeline(filePath, fileId, record.fileName, record.userId).catch((err) => {
       this.logger.error(`[P3-5 重试 ETL 异步管道崩溃] fileId=${fileId} ${err?.stack || err}`)
     })
     return { ok: true }
@@ -466,7 +488,11 @@ export class RagService {
     }
   }
 
-  private async parseDocumentToVectorStore(file: Express.Multer.File, fileId: number): Promise<void> {
+  private async parseDocumentToVectorStore(
+    file: Express.Multer.File,
+    fileId: number,
+    userId: number, // 【P0-1】写入 Qdrant metadata
+  ): Promise<void> {
     let rawText = ''
     const ext = path.extname(file.originalname).toLowerCase()
 
@@ -520,6 +546,7 @@ export class RagService {
           fileId: fileId,
           fileName: file.originalname,
           chunkIndex: index,
+          userId, // 【P0-1】Qdrant metadata 硬隔离
         },
       })
     })
@@ -536,6 +563,7 @@ export class RagService {
             fileName: file.originalname,
             chunkIndex: -1, // 摘要固定 chunkIndex=-1，方便识别
             chunkType: 'summary',
+            userId, // 【P0-1】Qdrant metadata 写 userId（硬隔离）
           },
         }),
       )
@@ -563,6 +591,7 @@ export class RagService {
             fileName: file.originalname,
             chunkIndex: doc.metadata?.chunkIndex ?? i, // 关联到原 chunk
             chunkType: 'faq',
+            userId, // 【P0-1】Qdrant metadata 硬隔离
           },
         }),
       )
@@ -936,6 +965,7 @@ ${chunkText.slice(0, 1500)}`
     file: Express.Multer.File,
     fileId: number,
     originalName: string,
+    userId: number, // 【P0-1】写入 Qdrant metadata
   ): Promise<void> {
     const ext = path.extname(originalName).toLowerCase()
     let sheets: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[]
@@ -972,6 +1002,7 @@ ${chunkText.slice(0, 1500)}`
               columns,
               rowIndices: [], // 摘要不绑具体行号
               chunkType: 'summary',
+              userId, // 【P0-1】Qdrant metadata 硬隔离
             },
           }),
         )
@@ -998,6 +1029,7 @@ ${chunkText.slice(0, 1500)}`
                 columns,
                 // 【P3-2】精确行号（单行；超长行兜底切时所有 sub-chunk 都属于该行）
                 rowIndices: [rowIndex],
+                userId, // 【P0-1】Qdrant metadata 硬隔离
               },
             }),
           )
@@ -1032,6 +1064,7 @@ ${chunkText.slice(0, 1500)}`
               columns: (doc.metadata as any)?.columns,
               rowIndices: (doc.metadata as any)?.rowIndices ?? [],
               chunkType: 'faq',
+              userId, // 【P0-1】Qdrant metadata 硬隔离
             },
           }),
         )
@@ -1068,17 +1101,15 @@ ${chunkText.slice(0, 1500)}`
    *
    * 注意：仅对 isFolder=0 的文件节点生效。目录删除由调用方保证不传目录 id。
    */
-  async deleteFileEntity(id: number): Promise<void> {
-    // 1) 先把记录读出来，拿到 fileUrl（用于定位磁盘文件）
-    const record = await this.ragFileRepository.findOneBy({ id })
-    if (!record) {
-      // 幂等：记录已不存在，直接返回
-      this.logger.log(`[RAG 删除] fileId=${id} 记录已不存在，跳过`)
-      return
-    }
-    if (record.isFolder === 1) {
-      throw new Error('不支持直接删除目录，请逐项删除内部文件')
-    }
+  async deleteFileEntity(
+    id: number,
+    userId: number,
+    isSuperAdmin: boolean,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    // 【P0-1】先按 userId 校验归属（超管跳过），防止越权删除
+    const record = await this.getOwnedFile(id, userId, isSuperAdmin)
+    if (!record) return { ok: false, reason: '文件不存在或无权访问' }
+    if (record.isFolder === 1) return { ok: false, reason: '不能删除文件夹' }
 
     // 2) 删 Qdrant 向量（按 metadata.fileId 过滤）
     try {
@@ -1115,6 +1146,7 @@ ${chunkText.slice(0, 1500)}`
     // 4) 最后删 DB 行（DB 是真源）
     await this.ragFileRepository.delete(id)
     this.logger.log(`[RAG 删除] DB 行清理完成 fileId=${id}`)
+    return { ok: true }
   }
 
   /**
@@ -1155,12 +1187,15 @@ ${chunkText.slice(0, 1500)}`
     fileId: number,
     sheetName: string,
     rowIndices: number[],
+    userId: number, // 【P0-1】归属校验（防越权引用预览）
+    isSuperAdmin: boolean,
   ): Promise<{ columns: string[]; rows: Array<Record<string, unknown>>; sheetName: string }> {
     const empty = { columns: [] as string[], rows: [] as Array<Record<string, unknown>>, sheetName }
     if (!Array.isArray(rowIndices) || rowIndices.length === 0) return empty
 
-    const record = await this.ragFileRepository.findOneBy({ id: fileId })
-    if (!record) throw new Error('文件不存在')
+    // 【P0-1】先校验归属，避免用户 A 通过引用预览拿用户 B 的 Excel 行数据
+    const record = await this.getOwnedFile(fileId, userId, isSuperAdmin)
+    if (!record) throw new Error('文件不存在或无权访问')
     if (record.ragTrack !== RagTrackEnum.SQL) {
       return empty // 非 SQL 轨道没"行"概念
     }
@@ -1301,6 +1336,21 @@ ${chunkText.slice(0, 1500)}`
   }
 
   /**
+   * 【P0-1】按 userId 校验文件归属，超管跳过过滤
+   * 样板来自 getOwnedSession；区别是会处理 SUPER_ADMIN 旁路
+   */
+  private async getOwnedFile(
+    fileId: number,
+    userId: number,
+    isSuperAdmin: boolean,
+  ): Promise<RagFileEntity | null> {
+    if (isSuperAdmin) {
+      return this.ragFileRepository.findOneBy({ id: fileId })
+    }
+    return this.ragFileRepository.findOne({ where: { id: fileId, userId } })
+  }
+
+  /**
    * 拉取一个会话的全部消息（按时间正序）
    */
   async listMessages(sessionId: number): Promise<RagMessageEntity[]> {
@@ -1392,25 +1442,27 @@ ${chunkText.slice(0, 1500)}`
   private async vectorSearch(
     question: string,
     fileIds: number[] | null,
+    userId: number, // 【P0-1】硬隔离：所有 Qdrant 检索必须按 userId 过滤
   ): Promise<{ doc: Document; score: number }[]> {
     try {
       const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
         url: this.qdrantUrl,
         collectionName: this.collectionName,
       })
-      // ⚠️ Qdrant 的 `match.any` 只对 array 字段有效，对 scalar int 字段会返回 0 命中。
-      // 单值用 `match: { value: X }`；多值用 `should` 拼多个 value 子句（语义等同"或"）。
-      let filter: any = undefined
+      // 【P0-1】filter 必须含 metadata.userId（企业 SaaS 硬隔离）：
+      //   - 即便 fileIds 为 null（全库检索 P1-6 模式），userId 仍然过滤当前用户的数据
+      //   - 多 fileId 用 should（"或"），单 fileId 用 match.value
+      const userIdClause = { key: 'metadata.userId', match: { value: userId } }
+      const filter: any = { must: [userIdClause] }
       if (Array.isArray(fileIds) && fileIds.length > 0) {
-        filter =
-          fileIds.length === 1
-            ? { must: [{ key: 'metadata.fileId', match: { value: fileIds[0] } }] }
-            : {
-                should: fileIds.map((id) => ({
-                  key: 'metadata.fileId',
-                  match: { value: id },
-                })),
-              }
+        if (fileIds.length === 1) {
+          filter.must.push({ key: 'metadata.fileId', match: { value: fileIds[0] } })
+        } else {
+          // 多 fileId：should 包在 must 里——"userId 是 X 且 fileId 是列表里任意一个"
+          filter.must.push({
+            should: fileIds.map((id) => ({ key: 'metadata.fileId', match: { value: id } })),
+          })
+        }
       }
       const raw = await vectorStore.similaritySearchWithScore(question, 4, filter as any)
       return raw.map(([doc, score]) => ({ doc, score }))
@@ -1426,6 +1478,7 @@ ${chunkText.slice(0, 1500)}`
     sources: number[],
     res: Response,
     userId: number,
+    isSuperAdmin: boolean, // 【P0-1】超管跳过 userId 过滤
     signal?: AbortSignal,
   ): Promise<void> {
     // 1) 解析/创建会话
@@ -1455,13 +1508,13 @@ ${chunkText.slice(0, 1500)}`
       let relevantDocs: { doc: Document; score: number }[] = []
       if (sources && sources.length > 0) {
         // 【P1-4】树形勾选：先把"文件夹 id + 文件 id"混合列表展开为纯文件 id
-        const effectiveFileIds = await this.expandAssetIdsToFileIds(sources)
+        const effectiveFileIds = await this.expandAssetIdsToFileIds(sources, userId, isSuperAdmin)
         if (effectiveFileIds.length > 0) {
-          relevantDocs = await this.vectorSearch(question, effectiveFileIds)
+          relevantDocs = await this.vectorSearch(question, effectiveFileIds, userId)
         }
       } else {
-        // 【P1-6】未勾选任何资产：走全库相似度检索（不带 fileId 过滤）
-        relevantDocs = await this.vectorSearch(question, null)
+        // 【P1-6】未勾选任何资产：走全库相似度检索，但【P0-1】仍必须按 userId 硬过滤
+        relevantDocs = await this.vectorSearch(question, null, userId)
       }
 
       if (relevantDocs.length === 0) {

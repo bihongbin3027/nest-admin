@@ -1,4 +1,4 @@
-import { Column, Entity, PrimaryGeneratedColumn, CreateDateColumn } from 'typeorm'
+import { Column, Entity, PrimaryGeneratedColumn, CreateDateColumn, Index } from 'typeorm'
 import { ApiProperty } from '@nestjs/swagger'
 
 export enum RagTrackEnum {
@@ -14,9 +14,18 @@ export enum VectorStatusEnum {
 }
 
 @Entity({ name: 'sys_rag_file' })
+// 【P0-1】复合索引：按 userId + parentId 查"我的目录下文件"是最高频查询
+@Index('IDX_RAG_FILE_USER', ['userId', 'parentId'])
 export class RagFileEntity {
   @PrimaryGeneratedColumn({ comment: '主键ID' })
   id: number
+
+  // 【P0-1】文件归属用户ID（企业 SaaS 红线：必须按用户隔离文件）
+  // 默认值 1 = 超管兜底（dev/demo 阶段历史数据全部归超管）
+  // 复合索引 (userId, parentId) 让"我的目录下文件列表"查询 O(log n)
+  @ApiProperty({ description: '所属用户 ID' })
+  @Column({ type: 'int', name: 'user_id', default: 1, comment: '所属用户ID（1=SUPER_ADMIN 默认兜底）' })
+  userId: number
 
   @Column({ type: 'varchar', length: 255, comment: '文件/文件夹名称' })
   fileName: string
