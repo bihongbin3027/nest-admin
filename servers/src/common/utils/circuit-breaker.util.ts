@@ -67,7 +67,7 @@ export function wrapWithBreaker<TArgs extends unknown[], TResult>(
   if (opts.onStateChange) opts.onStateChange('closed')
   breaker.on('open', () => {
     if (opts.onStateChange) opts.onStateChange('open')
-    // eslint-disable-next-line no-console
+     
     console.warn(`[CircuitBreaker ${opts.name}] 熔断器 OPEN（连续失败超过阈值）`)
   })
   breaker.on('halfOpen', () => {
@@ -75,7 +75,7 @@ export function wrapWithBreaker<TArgs extends unknown[], TResult>(
   })
   breaker.on('close', () => {
     if (opts.onStateChange) opts.onStateChange('closed')
-    // eslint-disable-next-line no-console
+     
     console.log(`[CircuitBreaker ${opts.name}] 熔断器 CLOSE（恢复）`)
   })
 

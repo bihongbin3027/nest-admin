@@ -54,6 +54,24 @@ export class RagFileEntity {
   @Column({ type: 'text', nullable: true, comment: '向量化失败原因归档' })
   errorMessage: string
 
+  // 【P0-1】xlsx 真表头行号（智能探测结果）
+  // - 默认 1（CSV / 标准无合并 xlsx）
+  // - 对"合并标题 + 真表头在 row N"文件，记录 N
+  // - 引用预览 / 回溯对齐用
+  @ApiProperty({ description: 'xlsx 真表头行号（1-based）' })
+  @Column({ type: 'int', nullable: true, name: 'header_row', comment: 'xlsx 真表头行号（智能探测）' })
+  headerRow: number | null
+
+  // 【P1-5】文件 sha256 —— 重传去重 / 缓存 key
+  @ApiProperty({ description: '文件内容 sha256 哈希（用于去重与缓存命中）' })
+  @Column({ type: 'varchar', length: 64, nullable: true, name: 'content_hash', comment: '文件内容 sha256' })
+  contentHash: string | null
+
+  // 【P1-5】文件原始修改时间
+  @ApiProperty({ description: '文件原始修改时间' })
+  @Column({ type: 'datetime', nullable: true, name: 'file_mtime', comment: '文件原始修改时间（来源磁盘 stat）' })
+  fileMtime: Date | null
+
   @ApiProperty({ description: '创建时间' })
   @CreateDateColumn({ type: 'timestamp', name: 'create_at', comment: '创建时间' })
   createdAt: Date

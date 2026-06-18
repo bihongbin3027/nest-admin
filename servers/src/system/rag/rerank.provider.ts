@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common'
+import { ConfigService } from '@nestjs/config'
 import * as path from 'path'
 
 // 【P2-1 修复 v2】onnxruntime-node 在 Windows 加载需要 VC++ Redistributable + 兼容 Node 版本
@@ -22,6 +23,10 @@ type Pipeline = any
  * - 启动安全：RagModule 加载时绝不触发 onnxruntime-node native binding 加载
  *   - 即使 Windows 上 DLL 失败（如缺 VC++ Redistributable），服务也能正常启动
  *   - 失败后该 Provider 退化为 no-op，vectorSearch topK=20 → 直接 slice(0, 4)
+ *
+ * 【P0-5】Rerank 截断字符数配置化：
+ *   - 旧硬编码 512 字符对中文偏短（BGE-reranker-base tokenizer 把中文 1 字符 ≈ 1.5 token，512 字符 ≈ 340 token，浪费了 512 context 的余量）
+ *   - 改从 `ai.rerank.charBudget` yml 读，默认 1024；P1-2 切到 v2-m3 后再调到 1500
  */
 @Injectable()
 export class RerankProvider {
@@ -31,8 +36,22 @@ export class RerankProvider {
   // 首次 ensureLoaded() 失败后置 true：避免后续 rerank() 反复重试 import（浪费时间）
   private transformersDisabled = false
 
-  // 模型名：multilingual BGE reranker base（quantized 后 ~280MB）
-  private static readonly MODEL_NAME = 'Xenova/bge-reranker-base'
+  // 模型名：可通过 ai.rerank.modelName 切换（默认 Xenova/bge-reranker-base，~280MB）
+  // 【P1-2】切到 'BAAI/bge-reranker-v2-m3' 拿到多语种 + 8K context + MTEB SOTA（q8 量化 ~568MB）
+  private readonly modelName: string
+
+  // 【P0-5】默认 1024 字符预算（覆盖 BGE-reranker-base 512 token 的 ~80%）
+  // v2-m3 context 8192 token ≈ 4500 字符；调到 1500 控延迟
+  private readonly charBudget: number
+
+  constructor(configService?: ConfigService) {
+    this.modelName =
+      configService?.get<string>('ai.rag.p1.rerankModel') ||
+      configService?.get<string>('ai.rerank.modelName') ||
+      'Xenova/bge-reranker-base'
+    const fromCfg = Number(configService?.get<number>('ai.rerank.charBudget'))
+    this.charBudget = Number.isFinite(fromCfg) && fromCfg > 0 ? fromCfg : 1024
+  }
 
   /**
    * 确保模型已加载（懒加载 + 并发安全：多次并发调用只下载一次）
@@ -46,19 +65,19 @@ export class RerankProvider {
     }
     if (this.loadingPromise) return this.loadingPromise
     this.loadingPromise = (async () => {
-      this.logger.log(`[P2-1 Rerank] 开始加载模型 ${RerankProvider.MODEL_NAME}（首次会下载 ~50MB）`)
+      this.logger.log(`[P2-1 Rerank] 开始加载模型 ${this.modelName}（首次会下载 ~50MB / v2-m3 ~568MB）`)
       const t0 = Date.now()
       // 动态 import：服务启动时绝不加载 onnxruntime-node
       const transformers: any = await import('@huggingface/transformers')
       // 显式设置 cacheDir：模型落到 <project>/.cache/transformers/（避免反复下载）
       transformers.env.cacheDir = path.join(process.cwd(), '.cache', 'transformers')
       transformers.env.allowLocalModels = true
-      // 【P2-1 修复 v4】dtype: 'q8' 加载 INT8 量化模型（~280MB）
-      // - 不指定 dtype 时默认下 fp32（1.1GB）—— 国内网络下载超时
+      // 【P2-1 修复 v4】dtype: 'q8' 加载 INT8 量化模型
+      // - bge-reranker-base q8 ~280MB；bge-reranker-v2-m3 q8 ~568MB
       // - 量化后精度损失极小，bge-reranker-base 内部本来就是 cos 距离，q8 误差 < 1%
       this.pipe = await transformers.pipeline(
         'text-classification',
-        RerankProvider.MODEL_NAME,
+        this.modelName,
         { dtype: 'q8' },
       )
       this.logger.log(`[P2-1 Rerank] 模型加载完成 耗时=${Date.now() - t0}ms`)
@@ -105,8 +124,11 @@ export class RerankProvider {
     if (!this.pipe) {
       throw new Error('[P2-1 Rerank] model pipe is null after ensureLoaded')
     }
-    // transformers.js pipeline 单次处理多条文本，第二个参数是数组
-    const outputs: any = await this.pipe(question, candidates.map((c) => c.pageContent.slice(0, 512)))
+    // 【P0-5】截断字符数可配置（ai.rerank.charBudget），默认 1024
+    const outputs: any = await this.pipe(
+      question,
+      candidates.map((c) => c.pageContent.slice(0, this.charBudget)),
+    )
     // outputs 形如 [{label:'LABEL_1', score:0.93}, ...]
     const scored = outputs.map((o: any, idx: number) => ({
       idx,

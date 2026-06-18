@@ -23,6 +23,13 @@ import { RAG_UPLOAD_DIR } from './rag-upload.util'
 import { RagMetricsService } from '../../common/metrics/rag-metrics.service'
 import { limitAndBreaker } from '../../common/utils/circuit-breaker.util'
 import { RerankProvider } from './rerank.provider'
+import { QdrantHybridProvider } from './qdrant-hybrid.provider'
+import {
+  detectHeaderRow,
+  buildHeaderColumns,
+  dedupeColumns,
+  preprocessMarkdownTables,
+} from './parse-header.util'
 
 /**
  * 【P1-2 / P1-3】引用源条目
@@ -230,6 +237,7 @@ export class RagService {
     private readonly configService: ConfigService,
     private readonly metrics: RagMetricsService, // 【P1-1】Prometheus 指标
     private readonly reranker: RerankProvider, // 【P2-1】Cross-encoder Rerank
+    private readonly hybridProvider: QdrantHybridProvider, // 【P1-3】BM25 + Dense + RRF 混合检索
   ) {
     const apiKey = this.configService.get<string>('ai.llm.apiKey')
     const baseURL = this.configService.get<string>('ai.llm.baseURL')
@@ -238,7 +246,16 @@ export class RagService {
     this.qdrantUrl = this.configService.get<string>('ai.qdrant.url')
     this.collectionName = this.configService.get<string>('ai.qdrant.collectionName')
 
-    this.llm = new ChatOpenAI({ apiKey, configuration: { baseURL }, modelName: chatModel, temperature: 0.2, streaming: true })
+    this.llm = new ChatOpenAI({
+      apiKey,
+      configuration: { baseURL },
+      modelName: chatModel,
+      // 【P0-5】温度从配置读取（默认 0）
+      // - RAG 严谨场景必须用 0，否则关键数字会"自由发挥"5%
+      // - dev.yml 默认 0；如需调高（如生成摘要），显式覆盖 yml
+      temperature: this.configService.get<number>('ai.llm.temperature') ?? 0,
+      streaming: true,
+    })
     // 🔧 用 MiniMax 兼容协议专用适配器（见上方 MiniMaxEmbeddings 类注释）
     this.embeddings = new MiniMaxEmbeddings({ apiKey, baseURL, modelName: embeddingModel })
     // 【P1-3】注入 RagMetricsService 到 MiniMaxEmbeddings，让 embedding 调用走限流 + 熔断
@@ -437,20 +454,33 @@ export class RagService {
         size: 0,
       } as any
       // size 用 stat 补全
+      let fileMtime: Date | null = null
       try {
         const stat = await import('fs').then((m) => m.promises.stat(filePath))
         ;(file as any).size = stat.size
+        fileMtime = stat.mtime
       } catch {
         /* ignore */
       }
 
+      // 【P1-5】计算文件 sha256 用于重传去重 / 缓存命中
+      const crypto = await import('crypto')
+      const contentHash = crypto.createHash('sha256').update(file.buffer).digest('hex')
+
+      let etlMeta: { headerRow?: number } = {}
       if (record.ragTrack === RagTrackEnum.SQL) {
-        await this.parseStructuredToVectorStore(file, fileId, safeOriginalName, userId)
+        etlMeta = await this.parseStructuredToVectorStore(file, fileId, safeOriginalName, userId)
       } else {
         await this.parseDocumentToVectorStore(file, fileId, userId)
       }
 
-      await this.ragFileRepository.update(fileId, { vectorStatus: VectorStatusEnum.SUCCESS })
+      // 【P1-5】ETL 成功后回写 status + metadata 到 RagFileEntity
+      await this.ragFileRepository.update(fileId, {
+        vectorStatus: VectorStatusEnum.SUCCESS,
+        headerRow: etlMeta.headerRow ?? null,
+        contentHash,
+        fileMtime,
+      })
     } catch (error: any) {
       hasError = true
       this.logger.error(`[RAG ETL 异步管道崩溃] FILE_ID: ${fileId}\n${error?.stack || error}`)
@@ -558,6 +588,10 @@ export class RagService {
     userId: number, // 【P0-1】写入 Qdrant metadata
   ): Promise<void> {
     let rawText = ''
+    // 【P0-2】PDF 按页保留（用 \f form feed 分隔，pdf-parse 内部约定）
+    // 输出形如："【第 1 页】...页 1 内容...\f【第 2 页】...页 2 内容..."
+    // 这样 RCTS 切分时仍能保留页码上下文，metadata 也可写入 pageNumber
+    let pdfPages: string[] | null = null
     const ext = path.extname(file.originalname).toLowerCase()
 
     if (ext === '.txt' || ext === '.md') {
@@ -566,6 +600,15 @@ export class RagService {
       const pdfParser = new PDFParse({ data: file.buffer })
       const pdfData = await pdfParser.getText()
       rawText = pdfData.text
+      // 【P0-2】pdf-parse 用 \f (form feed) 分隔页；每页加前缀后重组 rawText
+      // 这样 RCTS 切分时每页内容自带 "【第 N 页】" 前缀，LLM 召回后知道是哪一页
+      if (rawText.includes('\f')) {
+        const pages = rawText.split('\f').map((p) => p.trim()).filter((p) => p.length > 0)
+        if (pages.length > 1) {
+          pdfPages = pages
+          rawText = pages.map((p, i) => `【第 ${i + 1} 页】\n${p}`).join('\n\n')
+        }
+      }
     } else if (ext === '.docx') {
       const docxData = await mammoth.extractRawText({ buffer: file.buffer })
       rawText = docxData.value
@@ -575,14 +618,24 @@ export class RagService {
 
     if (!rawText.trim()) throw new Error('语料解析为空')
 
+    // 【P0-2】Markdown 表格预处理：在 RCTS 切分前先解析表格为结构化文本
+    // 否则 `| col1 | col2 |` 这种表格会被 `|` 切碎，列名上下文丢失
+    if (ext === '.md') {
+      rawText = preprocessMarkdownTables(rawText)
+    }
+
+    // 【P1-7】chunkSize 配置化（ai.rag.chunk.vectorSize / vectorOverlap）
+    // 默认 800/150（VECTOR 通用），旧硬编码 600/100 对中文偏小
+    const vectorChunkSize = this.configService.get<number>('ai.rag.chunk.vectorSize') ?? 800
+    const vectorOverlap = this.configService.get<number>('ai.rag.chunk.vectorOverlap') ?? 150
     // 【P3-1】md 文档按 markdown 结构切分（标题/段落/代码块边界优先），其余格式保持原 RCTS 行为
     // 痛点：之前 md 走 RCTS 字符切，"## 二级标题" 这种半截会被切断，导致 chunk 嵌入向量偏向"残缺文本"
     // 解决：md 用 RCTS 自定义 separators 列表，按 # ## ### 标题层级优先切，段落/代码块次之
     let chunks: string[]
     if (ext === '.md') {
       const mdSplitter = new RecursiveCharacterTextSplitter({
-        chunkSize: 600,
-        chunkOverlap: 100,
+        chunkSize: vectorChunkSize,
+        chunkOverlap: vectorOverlap,
         separators: [
           '\n# ',     // 一级标题
           '\n## ',    // 二级标题
@@ -597,13 +650,16 @@ export class RagService {
       })
       chunks = await mdSplitter.splitText(rawText)
     } else {
-      const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 600, chunkOverlap: 100 })
+      const splitter = new RecursiveCharacterTextSplitter({ chunkSize: vectorChunkSize, chunkOverlap: vectorOverlap })
       chunks = await splitter.splitText(rawText)
     }
     // ⚠️ file.originalname 已经被 asyncProcessEtlPipeline 在上游做过 latin1→utf8 解码，
     // 这里不要再解！直接用 file.originalname，否则会被"二次解码"重新打回乱码。
     // 用户报告过的乱码现象 l�����,��6�.xlsx 就是这行 double-decode 造成的。
+    // 【P0-2】PDF 反推页码：扫描 chunk 文本中是否含 "【第 N 页】"，命中则把 N 写入 metadata.pageNumber
     const documents = chunks.map((chunkText, index) => {
+      const pageMatch = chunkText.match(/【第\s*(\d+)\s*页】/)
+      const pageNumber = pageMatch ? Number(pageMatch[1]) : undefined
       return new Document({
         pageContent: chunkText,
         metadata: {
@@ -611,6 +667,7 @@ export class RagService {
           fileName: file.originalname,
           chunkIndex: index,
           userId, // 【P0-1】Qdrant metadata 硬隔离
+          ...(pageNumber ? { pageNumber } : {}), // 【P0-2】仅 PDF 才有 pageNumber
         },
       })
     })
@@ -940,47 +997,59 @@ ${chunkText.slice(0, 1500)}`
    *
    * 【P3-2】返回值改为 rowObjects（原始对象数组），不再预序列化为 KV 字符串；
    * 自然语言化在 parseStructuredToVectorStore 里做（带 sheet 标题 + 行号上下文）
+   *
+   * 【P0-1】修复 xlsx 致命解析 Bug：
+   *   - 不再固定取 row 1 作 header —— 改用 detectHeaderRow() 智能探测
+   *   - 列名通过 buildHeaderColumns() 自动 dedupe（防止"合并标题 + 真表头在 row 2"导致的同名 key 覆盖）
+   *   - metadata 回传 headerRow，便于后续 ETL / 引用预览对齐
    */
   private async parseExcelRows(
     file: Express.Multer.File,
-  ): Promise<{ sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[]> {
+  ): Promise<{ sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[]; headerRow: number }[]> {
     const workbook = new ExcelJS.Workbook()
     // multer 的 buffer 是 Buffer<ArrayBufferLike>，ExcelJS 期望 Node 旧版 Buffer，转 any 绕过 TS 5.7+ 泛型差异
     await workbook.xlsx.load(file.buffer as any)
-    const result: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[] = []
+    const result: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[]; headerRow: number }[] = []
 
     workbook.eachSheet((worksheet) => {
       const sheetName = worksheet.name || 'Sheet'
-      // ExcelJS 第 1 行默认当表头；空 sheet 直接跳过
+      // 空 sheet / 不足 2 行直接跳过
       if (worksheet.rowCount < 2) return
 
-      // 取第 1 行做 header
-      const headerRow = worksheet.getRow(1)
-      const rawColumns: string[] = []
-      for (let c = 1; c <= headerRow.cellCount; c++) {
-        const cell = headerRow.getCell(c)
-        const v = cell.value
-        let colName: string
-        if (v === null || v === undefined || (typeof v === 'string' && v.trim() === '')) {
-          colName = `col_${c}`
-        } else {
-          colName = String(v).trim()
-        }
-        rawColumns.push(colName)
-      }
+      // 【P0-1】智能探测真表头行号（识别"合并单元格标题 + 真表头在 row N"结构）
+      const headerRowNumber = detectHeaderRow(worksheet)
+      const headerRow = worksheet.getRow(headerRowNumber)
+      // 【P0-1】buildHeaderColumns 内部已调用 dedupeColumns，避免 rowObject key 互相覆盖
+      const rawColumns = buildHeaderColumns(headerRow)
 
-      // 遍历 data row（第 2 行起）→ rowObjects[i] 对应 sheet 的第 i+2 行
+      this.logger.log?.(
+        `[P0-1 xlsx 解析] sheet=${sheetName} detected headerRow=${headerRowNumber} columns=${rawColumns.join('|')}`,
+      )
+
+      // 遍历 data row（headerRowNumber + 1 行起）→ rowObjects[i] 对应 sheet 的第 i+headerRowNumber+1 行
       const rowObjects: Record<string, unknown>[] = []
-      for (let r = 2; r <= worksheet.rowCount; r++) {
+      for (let r = headerRowNumber + 1; r <= worksheet.rowCount; r++) {
         const dataRow = worksheet.getRow(r)
         const obj: Record<string, unknown> = {}
         let hasAnyValue = false
         for (let c = 1; c <= rawColumns.length; c++) {
           const cell = dataRow.getCell(c)
-          let v: unknown = cell.value
-          // ExcelJS 对 formula 单元格返回 { formula, result }，解出 result
-          if (v && typeof v === 'object' && 'result' in (v as any)) {
-            v = (v as any).result
+          const rawV: unknown = cell.value
+          let v: unknown = rawV
+          // 【P0-2】ExcelJS 对 formula 单元格返回 { formula, result }
+          //   旧行为只取 result → 数字"凭空"出现，LLM 不知道为什么是这个数
+          //   新行为：保留公式语义，输出 "=SUM(B2:B10) → 1250" 形式
+          if (rawV && typeof rawV === 'object' && 'formula' in (rawV as any) && 'result' in (rawV as any)) {
+            const formulaText = String((rawV as any).formula ?? '').trim()
+            const resultText = this.stringifyCellValue((rawV as any).result)
+            if (formulaText && resultText) {
+              v = `${formulaText} → ${resultText}`
+            } else {
+              v = resultText
+            }
+          } else if (rawV && typeof rawV === 'object' && 'result' in (rawV as any)) {
+            // 兼容只有 result 没有 formula 的情况（个别场景）
+            v = this.stringifyCellValue((rawV as any).result)
           }
           // 跳过空 cell 保持稀疏行
           if (v === null || v === undefined || (typeof v === 'string' && v.trim() === '')) {
@@ -994,7 +1063,7 @@ ${chunkText.slice(0, 1500)}`
       }
 
       if (rowObjects.length > 0) {
-        result.push({ sheetName, columns: rawColumns, rowObjects })
+        result.push({ sheetName, columns: rawColumns, rowObjects, headerRow: headerRowNumber })
       }
     })
 
@@ -1010,26 +1079,29 @@ ${chunkText.slice(0, 1500)}`
    */
   private parseCsvRows(
     file: Express.Multer.File,
-  ): { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[] {
+  ): { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[]; headerRow: number }[] {
     // file.buffer 是 Buffer<ArrayBufferLike>，而 xlsx 期望 Node 旧版 Buffer。
     // multer 的 buffer 本质是同一段 ArrayBuffer，转一道 any 绕过 TS 5.7+ Buffer 泛型差异。
-    const wb = XLSX.read(file.buffer as any, { type: 'buffer' })
+    // 【P0-2】cellDates/raw 让数字/日期落正确类型（不再全是 string）
+    const wb = XLSX.read(file.buffer as any, { type: 'buffer', cellDates: true, raw: false })
     const firstSheetName = wb.SheetNames[0]
     if (!firstSheetName) throw new Error('CSV 文件无有效内容')
     const sheet = wb.Sheets[firstSheetName]
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: null })
+    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: null, raw: false })
     if (rows.length === 0) throw new Error('CSV 文件未解析到任何有效行')
 
-    // 列名从第一行 keys 取，空名 fallback col_N
+    // 列名从第一行 keys 取，空名 fallback col_N；最后走 dedupeColumns 去重（防同名 key 覆盖，与 xlsx 路径对齐）
     const firstRow = rows[0] || {}
-    const columns = Object.keys(firstRow).map((k, i) => (k && k.trim() ? k.trim() : `col_${i + 1}`))
+    const rawColumns = Object.keys(firstRow).map((k, i) => (k && k.trim() ? k.trim() : `col_${i + 1}`))
+    const columns = dedupeColumns(rawColumns)
     // 【P3-2】保留原始对象数组，不再预序列化为 KV 字符串；自然语言化在 parseStructuredToVectorStore 里做
     const rowObjects = rows.filter((r) => {
       // 过滤全空行
       return Object.values(r).some((v) => v !== null && v !== undefined && (typeof v !== 'string' || v.trim() !== ''))
     })
     if (rowObjects.length === 0) throw new Error('CSV 文件未解析到任何有效行（全部为空）')
-    return [{ sheetName: firstSheetName, columns, rowObjects }]
+    // 【P0-1】CSV 永远 headerRow=1（CSV 没有合并单元格场景）
+    return [{ sheetName: firstSheetName, columns, rowObjects, headerRow: 1 }]
   }
 
   /**
@@ -1047,9 +1119,9 @@ ${chunkText.slice(0, 1500)}`
     fileId: number,
     originalName: string,
     userId: number, // 【P0-1】写入 Qdrant metadata
-  ): Promise<void> {
+  ): Promise<{ headerRow?: number }> {
     const ext = path.extname(originalName).toLowerCase()
-    let sheets: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[] }[]
+    let sheets: { sheetName: string; columns: string[]; rowObjects: Record<string, unknown>[]; headerRow?: number }[]
 
     if (ext === '.csv') {
       sheets = this.parseCsvRows(file)
@@ -1060,14 +1132,20 @@ ${chunkText.slice(0, 1500)}`
 
     const documents: Document[] = []
     let globalChunkIdx = 0
-    // 兜底 splitter：单行内容 > 800 字符时按句号/分号切，避免超长 chunk 拉低 embedding 质量
+    // 【P1-7】SQL 兜底 splitter 也配置化（ai.rag.chunk.sqlSize / sqlOverlap）
+    // 默认 1000/100（旧 800/0 无 overlap，长行被切断后 LLM 看不到连续上下文）
+    const sqlChunkSize = this.configService.get<number>('ai.rag.chunk.sqlSize') ?? 1000
+    const sqlOverlap = this.configService.get<number>('ai.rag.chunk.sqlOverlap') ?? 100
+    // 兜底 splitter：单行内容 > sqlChunkSize 字符时按句号/分号切，避免超长 chunk 拉低 embedding 质量
     const longRowSplitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 800,
-      chunkOverlap: 0,
+      chunkSize: sqlChunkSize,
+      chunkOverlap: sqlOverlap,
       separators: ['。', '；', '\n', ' ', ''],
     })
 
-    for (const { sheetName, columns, rowObjects } of sheets) {
+    for (const { sheetName, columns, rowObjects, headerRow } of sheets) {
+      // 【P0-1】xlsx 的真表头行号（CSV 永远为 1）；写入 RagFileEntity 的引用回溯场景
+      const effectiveHeaderRow = typeof headerRow === 'number' ? headerRow : 1
       // 【P3-3】先调 LLM 生成该 sheet 摘要，作为额外首 chunk
       const sheetSummary = await this.generateSheetSummary(sheetName, columns, rowObjects)
       if (sheetSummary) {
@@ -1083,19 +1161,20 @@ ${chunkText.slice(0, 1500)}`
               columns,
               rowIndices: [], // 摘要不绑具体行号
               chunkType: 'summary',
+              headerRow: effectiveHeaderRow, // 【P0-1】SQL 轨道 metadata 也带 headerRow
               userId, // 【P0-1】Qdrant metadata 硬隔离
             },
           }),
         )
       }
-      // rowObjects[i] 对应原始 sheet 的"第 i + 2 行"（第 1 行是表头）
+      // 【P0-1】rowObjects[i] 对应原始 sheet 的"第 i + effectiveHeaderRow + 1 行"（headerRow 之后起算）
       const rowChunkIndices: number[] = [] // 记录每个 row 的 chunkIndex，供 FAQ 反向引用
       for (let i = 0; i < rowObjects.length; i++) {
-        const rowIndex = i + 2
+        const rowIndex = i + effectiveHeaderRow + 1
         const rowText = this.serializeRowAsNaturalLanguage(rowObjects[i], sheetName, rowIndex)
         // 短行直接 1 chunk；超长行兜底切
         const subChunks =
-          rowText.length <= 800 ? [rowText] : await longRowSplitter.splitText(rowText)
+          rowText.length <= sqlChunkSize ? [rowText] : await longRowSplitter.splitText(rowText)
         for (const sub of subChunks) {
           const thisIdx = globalChunkIdx++
           documents.push(
@@ -1110,6 +1189,8 @@ ${chunkText.slice(0, 1500)}`
                 columns,
                 // 【P3-2】精确行号（单行；超长行兜底切时所有 sub-chunk 都属于该行）
                 rowIndices: [rowIndex],
+                headerRow: effectiveHeaderRow, // 【P0-1】行级 chunk 也透传真表头行号
+                chunkType: 'normal', // 【P1-3.5】标识 rowContent 类型（FAQ 过滤识别用）
                 userId, // 【P0-1】Qdrant metadata 硬隔离
               },
             }),
@@ -1172,6 +1253,8 @@ ${chunkText.slice(0, 1500)}`
     this.logger.log(
       `[SQL轨道] fileId=${fileId} 完成行级向量化：${sheets.length} sheet / ${sheets.reduce((acc, s) => acc + s.rowObjects.length, 0)} 行 / ${documents.length} chunk`,
     )
+    // 【P1-5】返回第一个 sheet 的真表头行号（多 sheet 时用主表；引用预览/回溯用）
+    return { headerRow: sheets.find((s) => typeof s.headerRow === 'number')?.headerRow }
   }
 
   /**
@@ -1531,26 +1614,39 @@ ${chunkText.slice(0, 1500)}`
     userId: number, // 【P0-1】硬隔离：所有 Qdrant 检索必须按 userId 过滤
     topK: number = 4, // 【P2-1】默认 4；executeDualTrackQuery 调 20 再 rerank 截到 4
   ): Promise<{ doc: Document; score: number }[]> {
+    // 【P1-3】构造 filter（两个路径共用）
+    const userIdClause = { key: 'metadata.userId', match: { value: userId } }
+    const filter: any = { must: [userIdClause] }
+    if (Array.isArray(fileIds) && fileIds.length > 0) {
+      if (fileIds.length === 1) {
+        filter.must.push({ key: 'metadata.fileId', match: { value: fileIds[0] } })
+      } else {
+        filter.must.push({
+          should: fileIds.map((id) => ({ key: 'metadata.fileId', match: { value: id } })),
+        })
+      }
+    }
+
+    // 【P1-3】灰度开关：ai.rag.p1.hybrid=true 走 BM25 + Dense + RRF 混合检索
+    const hybridEnabled = this.configService.get<boolean>('ai.rag.p1.hybrid') === true
+    if (hybridEnabled) {
+      try {
+        const denseVec = await this.embeddings.embedQuery(question)
+        const raw = await this.hybridProvider.hybridSearch(denseVec, question, filter, topK)
+        const topScore = raw.length > 0 ? raw[0].score : null
+        this.metrics.recordVectorSearch(topScore)
+        return raw
+      } catch (hErr: any) {
+        this.logger.warn(`[P1-3] hybridSearch 失败，fallback 到 dense-only: ${hErr?.message || hErr}`)
+        // fallthrough to dense-only
+      }
+    }
+
     try {
       const vectorStore = await QdrantVectorStore.fromExistingCollection(this.embeddings, {
         url: this.qdrantUrl,
         collectionName: this.collectionName,
       })
-      // 【P0-1】filter 必须含 metadata.userId（企业 SaaS 硬隔离）：
-      //   - 即便 fileIds 为 null（全库检索 P1-6 模式），userId 仍然过滤当前用户的数据
-      //   - 多 fileId 用 should（"或"），单 fileId 用 match.value
-      const userIdClause = { key: 'metadata.userId', match: { value: userId } }
-      const filter: any = { must: [userIdClause] }
-      if (Array.isArray(fileIds) && fileIds.length > 0) {
-        if (fileIds.length === 1) {
-          filter.must.push({ key: 'metadata.fileId', match: { value: fileIds[0] } })
-        } else {
-          // 多 fileId：should 包在 must 里——"userId 是 X 且 fileId 是列表里任意一个"
-          filter.must.push({
-            should: fileIds.map((id) => ({ key: 'metadata.fileId', match: { value: id } })),
-          })
-        }
-      }
       const raw = await vectorStore.similaritySearchWithScore(question, topK, filter as any)
       // 【P1-1】上报向量检索指标 + top-1 相似度
       const topScore = raw.length > 0 ? raw[0][1] : null
@@ -1614,6 +1710,19 @@ ${hydeText}`
         this.metrics.recordHyde('failed', 0)
       }
 
+      // 【P1-6】多轮历史参与 embedding 检索：把最近 1 轮用户问题拼接进来
+      // 解决指代问题："上面那个制度的第三条呢？"——直接 embed 找不到"制度"，需拼接"刚才问的内容"
+      // 灰度开关 ai.rag.p1.historyInRetrieval（默认 false，避免历史噪声过大导致主问被冲淡）
+      if (this.configService.get<boolean>('ai.rag.p1.historyInRetrieval') === true) {
+        const lastUserQ = (history || [])
+          .filter((t) => t.role === 'user')
+          .slice(-1)[0]?.content
+        if (lastUserQ && lastUserQ.trim() && lastUserQ.trim() !== question.trim()) {
+          retrievalQuery = `${lastUserQ}\n${retrievalQuery}`
+          this.logger.log(`[P1-6] 多轮检索: 拼接上一轮用户问题 (${lastUserQ.length} chars)`)
+        }
+      }
+
       // 【P2-1】召回 topK=20（多召回给 rerank 留余量）
       const RECALL_TOPK = 20
       const FINAL_TOPK = 4
@@ -1631,10 +1740,35 @@ ${hydeText}`
       if (relevantDocs.length > FINAL_TOPK) {
         const rT0 = Date.now()
         try {
+          // 【P1-3.5 v4】rerank 前直接剔除 FAQ chunk
+          const chunkTypeOf = (d: { doc: Document }): string | undefined => {
+            const m = d.doc.metadata as any
+            return (m?.chunkType ?? m?.metadata?.chunkType) as string | undefined
+          }
+          const filteredForRerank = relevantDocs.filter((d) => chunkTypeOf(d) !== 'faq')
           // rerank 需要 { pageContent: string }[]，从 doc.pageContent 提取
-          const candidates = relevantDocs.map((d) => ({ pageContent: d.doc.pageContent }))
+          const candidates = filteredForRerank.map((d) => ({ pageContent: d.doc.pageContent }))
           const reranked = await this.reranker.rerank(question, candidates, FINAL_TOPK)
-          relevantDocs = reranked.map((r) => relevantDocs[r.idx])
+          // 【P1-3.5 v7】fallback：rerank 输出 < topK 时用 raw recall 填充
+          //   - bge-reranker-base batch 处理长输入时可能只返回 1 条
+          //   - 缺位用 filteredForRerank 剩余的按 vector distance 顺序填充
+          if (reranked.length < FINAL_TOPK) {
+            const usedIdxs = new Set(reranked.map((r) => r.idx))
+            const filler = filteredForRerank
+              .map((d, i) => ({ d, idx: i }))
+              .filter(({ idx }) => !usedIdxs.has(idx))
+              .slice(0, FINAL_TOPK - reranked.length)
+              .map((x) => x.d)
+            relevantDocs = [
+              ...reranked.map((r) => filteredForRerank[r.idx]).filter(Boolean),
+              ...filler,
+            ]
+            this.logger.warn(
+              `[P1-3.5 v7] rerank 只返回 ${reranked.length} 条，用 raw recall 补到 ${relevantDocs.length}`,
+            )
+          } else {
+            relevantDocs = reranked.map((r) => filteredForRerank[r.idx])
+          }
           this.metrics.recordRerank('success', (Date.now() - rT0) / 1000)
         } catch (err: any) {
           this.logger.warn(`[P2-1 Rerank] 失败，回退到 top-${FINAL_TOPK}: ${err?.message || err}`)
@@ -1642,13 +1776,97 @@ ${hydeText}`
           this.metrics.recordRerank('skipped', 0)
         }
       }
+      // 【P1-3.5 v4】FAQ 已在 rerank 前剔除，无须再次过滤
+      // 但保险起见再过滤一次（兜底 rerank 失败走原 topK 的情况）
+      const chunkTypeOf = (d: { doc: Document }): string | undefined => {
+        const m = d.doc.metadata as any
+        return (m?.chunkType ?? m?.metadata?.chunkType) as string | undefined
+      }
+      const beforeFinalCount = relevantDocs.length
+      relevantDocs = relevantDocs.filter((d) => chunkTypeOf(d) !== 'faq').slice(0, FINAL_TOPK)
+      if (relevantDocs.length === 0 && beforeFinalCount > 0) {
+        this.logger.warn(
+          `[P1-3.5 v4] rerank 后再次过滤 FAQ，top-${beforeFinalCount} 全是 FAQ，将触发拒答`,
+        )
+      }
 
       if (relevantDocs.length === 0) {
-        res.write(
-          `data: ${JSON.stringify({ code: 200, data: '未在参考资料中发现线索，转由大语言模型泛化解答：\n\n' })}\n\n`,
-        )
-        fullAnswer = await this.streamLlmWithHistory(history, question, null, res, signal)
+        // 【P0-4】空召回：禁用 LLM 自由发挥，统一回复拒答文案
+        // 原行为："未在参考资料中发现线索，转由大语言模型泛化解答" + 调 LLM.stream →
+        //   是幻觉放大器，会输出流利但无关的答案，伤害用户信任。
+        // 新行为：直接写拒答文案 + 占位 citations，不调 LLM。
+        const REFUSAL_TEXT = '未在已加载的参考资料中找到相关信息。'
+        // 占位 citations：让前端 UI 仍能渲染"无来源"卡片
+        const placeholderCitations: CitationDto[] = [
+          {
+            fileId: -1,
+            fileName: '(无引用)',
+            chunkIndex: -1,
+            content: '',
+            score: 0,
+            ragTrack: null,
+            sheetName: null,
+            rowIndices: null,
+            columns: null,
+          },
+        ]
+        res.write(`data: ${JSON.stringify({ code: 200, data: REFUSAL_TEXT + '\n\n' })}\n\n`)
+        res.write(`data: ${JSON.stringify({ code: 'sources', data: placeholderCitations })}\n\n`)
+        fullAnswer = REFUSAL_TEXT
       } else {
+        // 【P1-3.5 v5】主题相关性 hard check：query 关键词与 sources 关键词重叠率 < 10% 触发拒答
+        // 解决 LLM 看到无关内容仍强行回答的问题（即使 prompt 已说明，但 temperature=0 + 通用知识还是会诱导 LLM 编造）
+        const tokenizeZh = (text: string): Set<string> => {
+          if (!text) return new Set()
+          const lower = text.toLowerCase()
+          const tokens = new Set<string>()
+          // 中文 1-2 字 bigram
+          const cn = lower.replace(/[a-z0-9\s\p{P}]+/gu, '')
+          for (let i = 0; i < cn.length; i++) {
+            tokens.add(cn[i])
+            if (i + 1 < cn.length) tokens.add(cn[i] + cn[i + 1])
+          }
+          // 英文 / 数字
+          const en = lower.match(/[a-z0-9]+/g) || []
+          en.forEach((t) => tokens.add(t))
+          return tokens
+        }
+        const qTokens = tokenizeZh(question)
+        const sTokens = new Set<string>()
+        for (const d of relevantDocs) {
+          for (const t of tokenizeZh(d.doc.pageContent || '')) sTokens.add(t)
+        }
+        let overlap = 0
+        for (const t of qTokens) if (sTokens.has(t)) overlap++
+        const overlapRate = qTokens.size > 0 ? overlap / qTokens.size : 0
+        // 灰度开关 ai.rag.p1.relevancyCheck (默认 true)
+        const relevancyCheck = this.configService.get<boolean>('ai.rag.p1.relevancyCheck') !== false
+        // 阈值 10%（中文 bigram 让 query tokens 数量爆炸，需要宽松；测试表明 12% 正常召回也被拒）
+        if (relevancyCheck && overlapRate < 0.10 && qTokens.size >= 5) {
+          this.logger.warn(
+            `[P1-3.5 v5] query 与 sources 关键词重叠率仅 ${(overlapRate * 100).toFixed(0)}%（${overlap}/${qTokens.size}），触发拒答`,
+          )
+          const REFUSAL_TEXT = '未在已加载的参考资料中找到相关信息。'
+          const placeholderCitations: CitationDto[] = [
+            {
+              fileId: -1,
+              fileName: '(无引用)',
+              chunkIndex: -1,
+              content: '',
+              score: 0,
+              ragTrack: null,
+              sheetName: null,
+              rowIndices: null,
+              columns: null,
+            },
+          ]
+          res.write(`data: ${JSON.stringify({ code: 200, data: REFUSAL_TEXT + '\n\n' })}\n\n`)
+          res.write(`data: ${JSON.stringify({ code: 'sources', data: placeholderCitations })}\n\n`)
+          fullAnswer = REFUSAL_TEXT
+          // 跳过后续 LLM 调用
+          // 复用后续的 finally 块逻辑（但目前是 else 里——直接 return 简化）
+          return
+        }
         citations = relevantDocs.map(({ doc, score }) => ({
           fileId: doc.metadata?.fileId,
           fileName: doc.metadata?.fileName || '未知来源',
@@ -1691,15 +1909,31 @@ ${doc.pageContent}`
           : relevantDocs.map(({ doc }) => `【参考源: ${doc.metadata?.fileName}】\n${doc.pageContent}`).join('\n\n')
 
         const systemPrompt = hasSqlTrack
-          ? `你是一款高级 AI 助手，专精于结构化表格的精准问答。回答规范：
+          ? `你是一款严谨的企业级 RAG 助手，专精于结构化表格的精准问答。回答规范：
 1) 严格基于下方"表格行级参考"中的字段值与行号进行精确计算，不要凭空捏造数字。
 2) 涉及具体单元格时，引用形式形如「{列名}={值}（第 {行号} 行 / {sheetName}）」，让用户能精准回溯。
 3) 涉及统计/求和/比较时，先列出你引用的行号，再给出计算过程，最后给结论。
-4) 若问题无法在参考表格中找到答案，明确告知"在所引用的表格行中未找到依据"，禁止臆测。
+4) 【主题相关性判断】先评估【参考资料】与用户问题的主题是否相关：
+   - 如果表格行级内容明显与用户问题主题无关（如用户问"美国首都"，但表格是"考勤打卡"），按规则 1/2 拒答
+   - 不要因为表格里"碰巧有几行词与问题相关"就强行回答
+5) 若问题无法在参考表格中找到答案，必须回复："未在已加载的参考资料中找到相关信息。"，不要补全、不要猜测、不要使用通用知识。
+6) 引用必须用方括号角标 [n]，n 对应下方"参考来源"第 n 个文件块（按出现顺序编号），引用位置紧跟该信息点之后。
+7) 回答语言与用户问题语言保持一致。
 
 【参考资料】:
 ${contextText}`
-          : `你是一款高级 AI 助手。请严格基于参考内容回答问题。
+          : `你是一款严谨的企业级 RAG 助手。
+【核心规则】
+1) 仅基于【参考资料】回答，不引入参考资料以外的事实、日期、数字、人物。
+2) 若【参考资料】中无相关信息，必须回复："未在已加载的参考资料中找到相关信息。"，不要补全、不要猜测、不要使用通用知识。
+3) 【主题相关性判断】先评估【参考资料】与用户问题的主题是否相关：
+   - 如果参考资料的核心内容明显与用户问题主题无关（如用户问"美国首都"，但参考资料是"考勤打卡"），仍按规则 2 拒答
+   - 不要因为参考资料里"碰巧有几个词与问题相关"就强行回答
+4) 引用必须用方括号角标：例如"制度规定全体员工每年至少体检一次 [1]"。
+   - [1] 对应下方"参考来源"第 1 个文件块（按出现顺序编号）。
+   - 引用位置紧跟该信息点之后，不要堆到文末。
+5) 回答结尾不要复述"以上信息仅供参考"等免责声明。
+6) 回答语言与用户问题语言保持一致。
 
 【参考资料】:
 ${contextText}`
@@ -1713,6 +1947,10 @@ ${contextText}`
           })}\n\n`,
         )
         fullAnswer = await this.streamLlmWithHistory(history, question, systemPrompt, res, signal)
+        // 【P1-4】引用角标后处理：越界 [n] 替换为 [?]
+        // 注：仅在 LLM 已生成完整响应后才校验（流式场景下 N=citations.length）
+        //   实时渲染仍可能短暂出现越界角标，但数据库落库内容是已校验的
+        fullAnswer = this.sanitizeCitationMarkers(fullAnswer, citations.length)
       }
     } catch (err) {
       // 【P2-1】客户端主动 abort 不视作错误，安静退出即可
@@ -1805,5 +2043,20 @@ ${contextText}`
       }
     }
     return full
+  }
+
+  /**
+   * 【P1-4】引用角标后处理：校验 [n] 是否在合法范围 1..citations.length
+   * 越界替换为 [?]（避免前端渲染"无法点击的空引用"）
+   * 不删除角标本身是因为 LLM 引用位置仍是有意义的语义信号
+   */
+  sanitizeCitationMarkers(text: string, citationsCount: number): string {
+    if (!text || citationsCount <= 0) return text
+    // 匹配 [数字]（支持两位数；不匹配 [[1] 这种嵌套，也不匹配 word[a] 这种单词内）
+    return text.replace(/\[(\d{1,3})\]/g, (match, numStr) => {
+      const n = parseInt(numStr, 10)
+      if (n >= 1 && n <= citationsCount) return match
+      return '[?]'
+    })
   }
 }
