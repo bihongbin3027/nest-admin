@@ -1,4 +1,4 @@
- 
+  
 import Path from 'path'
 import Log4js from 'log4js'
 import Util from 'util'
@@ -7,14 +7,21 @@ import * as StackTrace from 'stacktrace-js'
 import Chalk from 'chalk'
 import config from '../../../config/index'
 
+/**
+ * log4js 二次封装 + 自定义 Nest-Admin 输出格式
+ * - 静态 Logger 类对外暴露 trace/debug/info/warn/error/fatal/access 七个方法
+ * - 通过 getStackTrace 自动获取调用方坐标，输出文件名(行:列)便于排障
+ * - 自定义 layout 'Nest-Admin'：彩色 + 行号 + 模块名，开发环境 console，生产写文件按天切割
+ */
 const appLogDirConfig = config().app.logger.dir
 
+// 把相对路径的日志目录拼接为绝对路径，兼容容器内 cwd 与本地开发
 const baseLogPath = Path.normalize(
   Path.isAbsolute(appLogDirConfig) ? appLogDirConfig : Path.join(process.cwd(), appLogDirConfig),
 )
 
 const env = process.env.NODE_ENV
-// 日志级别
+// 日志级别（与 log4js 原生枚举对齐，单纯为了在 TS 侧引用更友好）
 export enum LoggerLevel {
   ALL = 'ALL',
   MARK = 'MARK',
@@ -27,7 +34,11 @@ export enum LoggerLevel {
   OFF = 'OFF',
 }
 
-// 内容跟踪类
+/**
+ * 日志内容跟踪类（用于把上下文与日志绑定）
+ * - 自定义 layout 会检测 logEvent.data 中的 ContextTrace 实例并取出 context / 坐标
+ * - 一般通过 Logger.trace(msg, new ContextTrace('UserService')) 这种用法传入
+ */
 export class ContextTrace {
   constructor(
     public readonly context: string,
@@ -176,45 +187,71 @@ Log4js.configure(getConfigure())
 const logger = Log4js.getLogger()
 logger.level = LoggerLevel.TRACE
 
+/**
+ * 日志对外门面（静态方法）
+ * - 业务侧统一调用 Logger.info / Logger.error / Logger.access 等，**不需要** 自己 new
+ * - 每个静态方法都会自动把调用方坐标（getStackTrace）作为第一条参数注入
+ * - 等级含义：
+ *     trace/debug   开发调试（生产被过滤）
+ *     info          正常业务日志（HTTP 响应等）
+ *     warn          4xx 客户端异常
+ *     error         5xx 与未捕获异常
+ *     fatal         致命错误（进程级）
+ *     access        HTTP 访问日志，独立 category 走 access.log 文件
+ */
 export class Logger {
+  /** 最细粒度跟踪日志（生产默认关闭） */
   static trace(...args) {
     logger.trace(Logger.getStackTrace(), ...args)
   }
 
+  /** 调试日志（生产默认关闭） */
   static debug(...args) {
     logger.debug(Logger.getStackTrace(), ...args)
   }
 
+  /** 通用日志（与 info 等价，保留兼容旧调用） */
   static log(...args) {
     logger.info(Logger.getStackTrace(), ...args)
   }
 
+  /** 普通业务日志（如 HTTP 200 响应、TransformInterceptor 包装输出） */
   static info(...args) {
     logger.info(Logger.getStackTrace(), ...args)
   }
 
+  /** 警告日志（如 HTTP 4xx） */
   static warn(...args) {
     logger.warn(Logger.getStackTrace(), ...args)
   }
 
+  /** warning 别名（兼容旧调用） */
   static warning(...args) {
     logger.warn(Logger.getStackTrace(), ...args)
   }
 
+  /** 错误日志（如 HTTP 5xx、未捕获异常） */
   static error(...args) {
     logger.error(Logger.getStackTrace(), ...args)
   }
 
+  /** 致命错误（进程级） */
   static fatal(...args) {
     logger.fatal(Logger.getStackTrace(), ...args)
   }
 
+  /** 访问日志（独立走 http category，写入 access.log） */
   static access(...args) {
     const loggerCustom = Log4js.getLogger('http')
     loggerCustom.info(Logger.getStackTrace(), ...args)
   }
 
-  // 日志追踪，可以追溯到哪个文件、第几行第几列
+  /**
+   * 获取调用方栈坐标（basename + 行:列）
+   * - deep 默认 2：跳过本函数 + 上层 Logger.xxx 包装
+   * @param deep 栈深度（默认 2，跳过自身 + 包装层）
+   * @returns "filename(line: L, column: C):" 形式字符串
+   */
   static getStackTrace(deep = 2): string {
     const stackList: StackTrace.StackFrame[] = StackTrace.getSync()
     const stackInfo: StackTrace.StackFrame = stackList[deep]

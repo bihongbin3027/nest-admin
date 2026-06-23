@@ -4,7 +4,7 @@ import { TerminusModule } from '@nestjs/terminus'
 import { HealthController } from './health.controller'
 
 /**
- * 【P1-1】健康检查模块
+ * 健康检查模块
  * - /api/health 综合健康检查
  * - /api/health/live k8s 存活探针
  * - /api/health/ready k8s 就绪探针

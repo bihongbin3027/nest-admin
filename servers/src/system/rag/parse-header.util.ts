@@ -1,7 +1,7 @@
 import * as ExcelJS from 'exceljs'
 
 /**
- * P0-1：Excel/CSV 智能表头检测工具
+ * Excel/CSV 智能表头检测工具
  *
  * 痛点：原 parseExcelRows 固定把第 1 行当 header，对"合并单元格标题 + 真表头在第 2 行"
  *       的 xlsx（如"公司人事部基本规章制度.xlsx"）会导致：
@@ -9,14 +9,21 @@ import * as ExcelJS from 'exceljs'
  *
  * 解决方案：
  *   - detectHeaderRow：扫描前 N 行，找出"有效列名比例 = 去重值数 / 列数"最高的行作为 header
- *   - isMergedStart：判断某行是否是合并单元格起始行（用作辅助信号）
+ *   - isMergedStartRow：判断某行是否是合并单元格起始行（用作辅助信号）
  *   - buildHeaderColumns：从 header 行取 cells → dedupeColumns 去重 → 输出稳定列名
  *   - dedupeColumns：把重复列名加 _2, _3 后缀，避免对象 key 互相覆盖
+ *   - preprocessMarkdownTables：把 Markdown 表格提前转为"表头/行1/行2..."自然语言结构，
+ *     避免 RecursiveCharacterTextSplitter 把 `| col1 | col2 |` 切碎导致列名上下文丢失
  */
 
+/** 表头扫描上限行数；超过 10 行的合并大标题视为异常输入 */
 const MAX_HEADER_SCAN_ROWS = 10
-const VALID_HEADER_RATIO_THRESHOLD = 0.6 // 去重值数 / 列数 < 0.6 视为"非 header"
+/** 去重值数 / 列数 < 0.6 视为"非 header"（合并标题整行同名，比例约 1/列数） */
+const VALID_HEADER_RATIO_THRESHOLD = 0.6
 
+/**
+ * 合并区段的结构化表示
+ */
 interface MergeRange {
   top: number
   left: number
@@ -26,7 +33,10 @@ interface MergeRange {
 }
 
 /**
- * 解析 worksheet.model.merges 为结构化数组（兼容 ExcelJS 两种返回形态）
+ * 解析 worksheet.model.merges 为结构化数组
+ * - 兼容 ExcelJS 两种返回形态：字符串 `'A1:B2'` 或对象 `{top,left,bottom,right}`
+ * @param worksheet ExcelJS worksheet 实例
+ * @returns 结构化的合并区段数组
  */
 function extractMerges(worksheet: ExcelJS.Worksheet): MergeRange[] {
   const merges: any = (worksheet as any).model?.merges ?? []
@@ -74,16 +84,22 @@ function extractMerges(worksheet: ExcelJS.Worksheet): MergeRange[] {
 
 /**
  * 判断 rowNumber 是否为某合并区段的"起始行"
+ * @param merges    已提取的合并区段数组
+ * @param rowNumber 目标行号（1-based）
+ * @returns 是否为某合并区段的起始行
  */
 function isMergedStartRow(merges: MergeRange[], rowNumber: number): boolean {
   return merges.some((m) => m.top === rowNumber)
 }
 
 /**
- * 计算 rowNumber 行的"有效列名比例"：
- *   - 取该行所有 cells 的 value，去 trim 后收集非空且去重
- *   - 比例 = 去重数 / 总列数（worksheet.columnCount 或 row.cellCount）
- *   - 列名全相同（如合并标题）→ 比例 = 1/列数 → 极低
+ * 计算 rowNumber 行的"有效列名比例"
+ * - 取该行所有 cells 的 value，去 trim 后收集非空且去重
+ * - 比例 = 去重数 / 总列数（worksheet.columnCount 或 row.cellCount）
+ * - 列名全相同（如合并标题）→ 比例 = 1/列数 → 极低
+ * @param worksheet ExcelJS worksheet 实例
+ * @param rowNumber 目标行号（1-based）
+ * @returns 0..1 之间的有效列名比例
  */
 function computeHeaderRatio(worksheet: ExcelJS.Worksheet, rowNumber: number): number {
   const row = worksheet.getRow(rowNumber)
@@ -103,13 +119,15 @@ function computeHeaderRatio(worksheet: ExcelJS.Worksheet, rowNumber: number): nu
 }
 
 /**
- * P0-1 核心：智能探测真表头行号（1-based）
+ * 核心：智能探测真表头行号（1-based）
  *
- * 策略：
+ * - 策略：
  *   1. 扫描前 MAX_HEADER_SCAN_ROWS 行
  *   2. 优先排除"合并单元格起始行"（这类行通常是大标题）
  *   3. 找首个"有效列名比例 ≥ 阈值"的行作为 header
  *   4. 兜底：返回第 1 行（旧行为，确保向后兼容）
+ * @param worksheet ExcelJS worksheet 实例
+ * @returns 1-based 表头行号
  */
 export function detectHeaderRow(worksheet: ExcelJS.Worksheet): number {
   const totalRows = Math.min(worksheet.rowCount, MAX_HEADER_SCAN_ROWS)
@@ -145,8 +163,11 @@ export function detectHeaderRow(worksheet: ExcelJS.Worksheet): number {
 /**
  * 把 header 行的 cells 转为字符串数组 + dedupeColumns 去重
  *
- *   - 空 cell fallback `col_${c}`
- *   - 重复列名加 `_2` `_3` 后缀
+ * - 空 cell fallback `col_${c}`
+ * - 重复列名加 `_2` `_3` 后缀
+ * - 支持公式 cell（取 result）、富文本 cell（拼接 richText.text）
+ * @param headerRow ExcelJS Row 实例
+ * @returns 去重后的列名数组
  */
 export function buildHeaderColumns(headerRow: ExcelJS.Row): string[] {
   const rawColumns: string[] = []
@@ -177,7 +198,9 @@ export function buildHeaderColumns(headerRow: ExcelJS.Row): string[] {
 
 /**
  * 列名去重：把 ['序号','制度','制度'] → ['序号','制度','制度_2']
- * 防止 rowObject key 互相覆盖（这就是原 bug 的根因之一）
+ * - 防止 rowObject key 互相覆盖（这就是原 bug 的根因之一）
+ * @param cols 原始列名数组
+ * @returns 去重后的列名数组
  */
 export function dedupeColumns(cols: string[]): string[] {
   const seen = new Map<string, number>()
@@ -197,16 +220,16 @@ export function dedupeColumns(cols: string[]): string[] {
 /**
  * P0-2：Markdown 表格预处理
  *
- * 问题：原解析走 RCTS 默认 separators（`\n\n → \n → 。 → ' '`），会把 `| col1 | col2 |` 切碎。
- *      LLM 召回的 chunk 看到的是"列名 = = ="而不是完整表格行，结构信息全丢。
+ * - 问题：原解析走 RCTS 默认 separators（`\n\n → \n → 。 → ' '`），会把 `| col1 | col2 |` 切碎
+ *   LLM 召回的 chunk 看到的是"列名 = = ="而不是完整表格行，结构信息全丢
  *
- * 解决方案：
+ * - 解决方案：
  *   1. 识别 markdown 表格（连续行符合 `|...|`）
  *   2. 找到 header 行 + 分隔行（|---|---|）+ 数据行
  *   3. 把每行数据行转成 "表头: 值1 | 值2 | ..." 形式（行级自然语言化）
  *   4. 替换回原位置（保留上下文）
  *
- * 示例：
+ * - 示例：
  *   输入:
  *     | 姓名 | 年龄 |
  *     | --- | --- |
@@ -218,6 +241,8 @@ export function dedupeColumns(cols: string[]): string[] {
  *     表头: 姓名 | 年龄
  *     行1: 张三 | 30
  *     行2: 李四 | 25
+ * @param rawText 原始 md 文本
+ * @returns 预处理后的文本（表格已被展开为自然语言段）
  */
 export function preprocessMarkdownTables(rawText: string): string {
   if (!rawText.includes('|')) return rawText
@@ -261,9 +286,11 @@ export function preprocessMarkdownTables(rawText: string): string {
 }
 
 /**
- * 把 `| a | b | c |` 拆成 ['a', 'b', 'c']
+ * 把单行 markdown 表格行拆成 cell 数组
  * - 去除首尾的 `|`
  * - 去除每个 cell 前后空白
+ * @param line 形如 `| a | b | c |` 的字符串
+ * @returns cell 字符串数组
  */
 function splitTableRow(line: string): string[] {
   let s = line.trim()

@@ -8,7 +8,7 @@ import {
 } from '@nestjs/terminus'
 
 /**
- * 【P1-1】健康检查端点
+ * 健康检查端点
  * - GET /api/health      综合健康检查（DB + 磁盘 + 内存）
  * - GET /api/health/live  存活探针（k8s livenessProbe）
  * - GET /api/health/ready 就绪探针（k8s readinessProbe）
@@ -26,6 +26,11 @@ export class HealthController {
     private readonly memory: MemoryHealthIndicator,
   ) {}
 
+  /**
+   * 综合健康检查（GET /api/health）
+   * - DB pingCheck（1.5s 超时）+ 磁盘 < 80% + 内存 heap/RSS 阈值
+   * - 任一指标失败返回 503，前端/k8s 据此告警
+   */
   @Get()
   @HealthCheck()
   check() {
@@ -45,6 +50,10 @@ export class HealthController {
     ])
   }
 
+  /**
+   * 存活探针（GET /api/health/live，k8s livenessProbe）
+   * - 只看进程内存，外部依赖短暂故障不应触发 pod 重启
+   */
   @Get('live')
   @HealthCheck()
   live() {
@@ -52,6 +61,10 @@ export class HealthController {
     return this.health.check([() => this.memory.checkHeap('memory_heap', 300 * 1024 * 1024)])
   }
 
+  /**
+   * 就绪探针（GET /api/health/ready，k8s readinessProbe）
+   * - DB 可连 + RSS 够才接流量；失败时从 service endpoints 摘除但 pod 不重启
+   */
   @Get('ready')
   @HealthCheck()
   ready() {

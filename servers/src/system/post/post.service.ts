@@ -12,6 +12,12 @@ import { CreatePostDto } from './dto/create-post.dto'
 import { UpdatePostDto } from './dto/update-post.dto'
 import { FindPostListDto } from './dto/findPostList.dto'
 
+/**
+ * 岗位 Service
+ * - 岗位的 CRUD 业务逻辑
+ * - 创建时按 (code, name) 联合查重，避免业务键冲突
+ * - 列表查询支持 name / code 模糊搜索与 status 精确过滤，按 orderNum desc 排序
+ */
 @Injectable()
 export class PostService {
   constructor(
@@ -23,6 +29,7 @@ export class PostService {
 
   /** 创建岗位 */
   async create(dto: CreatePostDto): Promise<ResultData> {
+    // 按 (code, name) 联合查重，业务键冲突直接返回错误
     const existing = await this.postRepo.findOne({ where: { code: dto.code, name: dto.name } })
     if (existing) return ResultData.fail(AppHttpCode.POST_REPEAT, '当前岗位名称与编码已存在，请修改后重新创建')
     const post = plainToInstance(PostEntity, dto)
@@ -55,9 +62,10 @@ export class PostService {
     return ResultData.ok()
   }
 
-  /** 查询岗位 */
+  /** 查询岗位列表（分页 + 模糊搜索 + 状态过滤） */
   async findList(dto: FindPostListDto): Promise<ResultData> {
     const { size, page, name, code, status } = dto
+    // 动态 where：name / code 模糊匹配，status 精确匹配
     const where = {
       ...(name ? { name: Like(`%${name}%`) } : null),
       ...(code ? { code: Like(`%${code}%`) } : null),
@@ -65,6 +73,7 @@ export class PostService {
     }
     const posts = await this.postRepo.findAndCount({
       where,
+      // 多列排序：先按 orderNum 倒序，再按 id 倒序兜底
       order: { orderNum: 'DESC', id: 'DESC', createDate: 'DESC' },
       skip: size * (page - 1),
       take: size,

@@ -5,11 +5,19 @@ import { UnauthorizedException, Injectable } from '@nestjs/common'
 
 import { AuthService } from './auth.service'
 
+/**
+ * JWT 鉴权策略（passport-jwt）
+ * - 从 Authorization: Bearer <token> 头抽取 JWT，使用 HS256 + 配置中的 jwt.secretkey 校验签名
+ * - 校验通过后将 token payload 交给 validate 方法查用户；返回的 user 会被 passport 挂到 req.user
+ * - 配合全局 JwtAuthGuard 使用：默认拦截所有非白名单接口
+ */
 @Injectable()
 export class AuthStrategy extends PassportStrategy(Strategy) {
   /**
-   * 这里的构造函数向父类传递了授权时必要的参数，在实例化时，父类会得知授权时，客户端的请求必须使用 Authorization 作为请求头，
-   * 而这个请求头的内容前缀也必须为 Bearer，在解码授权令牌时，使用秘钥 secretOrKey: 'secretKey' 来将授权令牌解码为创建令牌时的 payload。
+   * 构造时向 passport-jwt 父类传入运行时配置：
+   * - jwtFromRequest：从 Authorization: Bearer <token> 头抽取 token
+   * - secretOrKey：使用配置项 jwt.secretkey 作为签名校验密钥
+   * - algorithms：限定 HS256，避免 alg=none 等攻击
    */
   constructor(private readonly authService: AuthService, private readonly config: ConfigService) {
     super({
@@ -20,14 +28,15 @@ export class AuthStrategy extends PassportStrategy(Strategy) {
   }
 
   /**
-   * validate 方法实现了父类的抽象方法，在解密授权令牌成功后，即本次请求的授权令牌是没有过期的，
-   * 此时会将解密后的 payload 作为参数传递给 validate 方法，这个方法需要做具体的授权逻辑，比如这里我使用了通过用户名查找用户是否存在。
-   * 当用户不存在时，说明令牌有误，可能是被伪造了，此时需抛出 UnauthorizedException 未授权异常。
-   * 当用户存在时，会将 user 对象添加到 req 中，在之后的 req 对象中，可以使用 req.user 获取当前登录用户。
+   * passport-jwt 的钩子：签名 + 过期校验通过后由父类回调
+   * - payload 即 token 解码后的内容（创建时塞入的 { id }）
+   * - 返回值会被 passport 自动挂到 req.user，供下游守卫（RolesGuard）和业务方法使用
+   * @param payload JWT 解析后的负载 { id }
+   * @returns 当前登录用户实体；不存在时抛 UnauthorizedException
    */
   async validate(payload: { id: string }) {
     const user = await this.authService.validateUser(payload)
-    // 如果用用户信息，代表 token 没有过期，没有则 token 已失效
+    // 命中即代表 token 未过期且对应用户存在；找不到则视为伪造或已被禁用
     if (!user) throw new UnauthorizedException()
     return user
   }

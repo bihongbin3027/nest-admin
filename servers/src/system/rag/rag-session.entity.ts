@@ -3,8 +3,11 @@ import { ApiProperty } from '@nestjs/swagger'
 import { RagMessageEntity } from './rag-message.entity'
 
 /**
- * 【P1-2】RAG 多轮会话主表
- * 一名用户可有 N 个会话，每个会话按 updated_at DESC 排序展示
+ * RAG 多轮会话主表（sys_rag_session）
+ *
+ * - 一名用户可有 N 个会话，每个会话按 updated_at DESC 排序展示
+ * - 与 RagMessageEntity 是一对多关系（删除会话级联清理消息）
+ * - title 默认值 "新会话"，首条消息写入后会自动改写为前 20 字摘要
  */
 @Entity({ name: 'sys_rag_session' })
 export class RagSessionEntity {

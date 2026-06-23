@@ -16,6 +16,14 @@ import { UserService } from './user.service'
 
 import { BaseController } from './base.controller'
 import { UserController } from './user.controller'
+
+/**
+ * 用户模块 UserModule
+ * - 负责用户、用户-角色、用户-部门、用户-岗位等实体的注册
+ * - 注册 JwtModule（异步读取 yml 的 jwt.* 配置），供 UserService.genToken 签发 token
+ * - forwardRef(() => AuthModule) 避免 AuthModule 与 UserModule 之间循环依赖
+ * - 导出 UserService 供其他模块（如 auth）复用
+ */
 @Module({
   imports: [
     TypeOrmModule.forFeature([UserEntity, UserRoleEntity, UserDeptEntity, UserPostEntity]),

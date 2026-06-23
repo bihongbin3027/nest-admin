@@ -6,19 +6,16 @@ import { RagService } from './rag.service'
 import { RAG_ETL_QUEUE_NAME, RAG_ETL_JOB_RUN, RagEtlJobData } from './rag-etl.constants'
 
 /**
- * 【P1-2】RAG ETL Processor
+ * RAG ETL 队列消费者
  *
- * 消费 BullMQ 队列里的 ETL 任务，调用 RagService 的核心 ETL 逻辑：
- * - concurrency=3 等价于原 SimpleSemaphore(3)
- * - attempts + backoff 由 BullMQ 统一管理（jobs 上配置）
- * - job 失败自动重试 3 次，最终失败落 failed（attempts exhausted）
+ * - 职责：消费 rag-etl 队列里的 ETL Job，委托给 RagService.runEtlJob 执行
+ * - concurrency=3：等价于原 SimpleSemaphore(3)，控制 ETL 并发上限
+ * - 失败处理：抛错让 BullMQ 走 attempts + 指数退避策略（最多 3 次：2s → 4s → 8s）
+ * - 关键调参（必须显式拉大，避免 Windows + onnxruntime 启动慢导致的 stalled 误判）：
+ *   - lockDuration: 300000 (5 分钟)
+ *   - stalledInterval: 60000 (1 分钟)
  *
- * 【P2-1 修复 v4】lockDuration 必须设大（5min），stalledInterval 设 1min：
- * - 默认 lockDuration=30s + stalledInterval=30s 在 Redis 5.0.14.1 + Windows + onnxruntime
- *   启动慢的组合下，会导致 ETL 启动的几秒内 lock 看似过期，被 stalled check 误判为
- *   "job stalled more than allowable limit" 并写 defa，后续 moveToFinished 命中
- *   deferredFailure 路径直接 fail，process() 永远不执行
- * - 把 lockDuration 拉到 5min、stalledInterval 拉到 1min 后这个问题消失
+ * @see 文件顶部模块级注释：详细解释 lockDuration / stalledInterval 调参原因
  */
 @Processor(RAG_ETL_QUEUE_NAME, {
   concurrency: 3, // 等价 SimpleSemaphore(3)
@@ -33,7 +30,7 @@ export class RagFileProcessor extends WorkerHost {
   }
 
   /**
-   * 【P2-1】监听 Worker 关键事件：
+   * 监听 Worker 关键事件：
    * - 'error' 捕获所有 BullMQ 内部错误
    * - 'failed' 监控 job 失败原因（特别是 "stalled" 误判时及时告警）
    */

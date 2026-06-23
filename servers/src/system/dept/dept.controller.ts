@@ -10,12 +10,21 @@ import { DeptService } from './dept.service'
 import { CreateDeptDto } from './dto/create-dept.dto'
 import { UpdateDeptDto } from './dto/update-dept.dto'
 
+/**
+ * 部门模块 Controller
+ * - 提供部门的 CRUD：create / update / list / delete
+ * - 路由前缀 /dept
+ */
 @ApiTags('部门模块')
 @ApiBearerAuth()
 @Controller('dept')
 export class DeptController {
   constructor(private readonly deptService: DeptService) {}
 
+  /**
+   * 创建部门
+   * @param dto CreateDeptDto
+   */
   @Post()
   @ApiOperation({ summary: '创建部门' })
   @ApiResult(DeptEntity)
@@ -23,6 +32,10 @@ export class DeptController {
     return this.deptService.create(dto)
   }
 
+  /**
+   * 更新部门
+   * @param dto UpdateDeptDto
+   */
   @Put()
   @ApiOperation({ summary: '部门更新' })
   @ApiResult()
@@ -30,6 +43,7 @@ export class DeptController {
     return this.deptService.update(dto)
   }
 
+  /** 查询部门列表（树形结构由前端组装，后端返回扁平列表） */
   @Get('list')
   @ApiOperation({ summary: '查询部门列表' })
   @ApiResult(DeptEntity, true)
@@ -37,6 +51,10 @@ export class DeptController {
     return this.deptService.find()
   }
 
+  /**
+   * 删除部门（同时级联删除其下子部门）
+   * @param id 部门 id
+   */
   @Delete(':id')
   @ApiOperation({ summary: '删除部门' })
   @ApiResult()

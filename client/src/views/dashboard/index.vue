@@ -1,6 +1,6 @@
 <template>
   <div class="dashboard-chat-container">
-    <!-- 🌟【P1-2】左侧栏：会话列表 + 知识源选择 -->
+    <!-- 🌟左侧栏：会话列表 + 知识源选择 -->
     <div class="knowledge-sidebar">
       <!-- 会话区 -->
       <div class="sidebar-section sidebar-session">
@@ -205,7 +205,7 @@
                 </div>
                 <div class="bubble-content" v-html="renderMarkdown(msg.content)"></div>
 
-                <!-- 【P2-1】停止徽标：用户主动中断时贴在内容下方，保留至此前已流出的字符 -->
+                <!-- 停止徽标：用户主动中断时贴在内容下方，保留至此前已流出的字符 -->
                 <div v-if="msg.stopped" class="stopped-badge">
                   <el-icon><VideoPause /></el-icon>
                   <span>
@@ -254,7 +254,7 @@
                         </div>
                         <div class="citation-snippet">{{ src.content }}…</div>
                         <div class="citation-meta">
-                          <!-- 【P1-3】SQL 轨道：sheet + 行号；vector 轨道：切片号 -->
+                          <!-- SQL 轨道：sheet + 行号；vector 轨道：切片号 -->
                           <template v-if="src.ragTrack === 'sql'">
                             <span class="meta-chunk">
                               <el-icon><Files /></el-icon>
@@ -349,7 +349,7 @@
           </span>
         </div>
 
-        <!-- 【P1-3】SQL 轨道：渲染真实行表格 -->
+        <!-- SQL 轨道：渲染真实行表格 -->
         <div v-if="previewCitation.ragTrack === 'sql'" class="preview-table-wrapper" v-loading="previewTableLoading">
           <table v-if="previewTableData && previewTableData.columns.length > 0" class="preview-table">
             <thead>
@@ -423,7 +423,7 @@ import {
   Aim
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
-// 【P2-2】rAF 合并渲染：用 useRafFn 把 onChunk 的多次赋值合并为 1 帧 1 次 marked
+// rAF 合并渲染：用 useRafFn 把 onChunk 的多次赋值合并为 1 帧 1 次 marked
 import { useRafFn } from '@vueuse/core'
 import {
   getKnowledgeFileList,
@@ -439,7 +439,7 @@ import {
 } from '@/api/rag'
 
 /**
- * 【P1-4】el-tree 节点结构
+ * el-tree 节点结构
  * - isFolder = 1：目录节点，可能含 children
  * - isFolder = 0：文件叶子节点
  */
@@ -457,7 +457,7 @@ interface ChatMessage {
   content: string
   sources?: CitationItem[]
   sourcesExpanded?: boolean
-  // 【P2-1】用户主动中断后置 true，UI 渲染"已停止生成"徽标
+  // 用户主动中断后置 true，UI 渲染"已停止生成"徽标
   stopped?: boolean
 }
 
@@ -640,7 +640,7 @@ const inputQuery = ref('')
 const streamingActive = ref(false)
 const scrollbarRef = ref()
 
-// 🌟【P2-2】流式 markdown rAF 节流开关：true 走 rAF 合并（1 帧最多 1 次 marked）
+// 🌟流式 markdown rAF 节流开关：true 走 rAF 合并（1 帧最多 1 次 marked）
 // false 一键回退到旧版"每 chunk 一次 marked + 一次 v-html"行为
 const USE_STREAM_RENDER_THROTTLE = ref(true)
 // rAF 帧间通讯：故意用普通 let 而非 ref —— 这两个变量不应该进入响应式系统，
@@ -661,14 +661,14 @@ const streamingRaf = useRafFn(
   { immediate: false }
 )
 
-// 🌟【P2-1】当前流式请求的 AbortController，停止按钮触发 abort
+// 🌟当前流式请求的 AbortController，停止按钮触发 abort
 // 旧值在 finally 里清理，保证下一次 submit 能拿到全新 controller
 const abortControllerRef = ref<AbortController | null>(null)
 
 // 🌟【P1-2 + P1-3】引用预览弹窗
 const previewVisible = ref(false)
 const previewCitation = ref<CitationItem | null>(null)
-// 【P1-3】SQL 引用预览的迷你表格数据
+// SQL 引用预览的迷你表格数据
 const previewTableLoading = ref(false)
 const previewTableData = ref<{
   sheetName: string
@@ -788,7 +788,7 @@ const openCitationPreview = async (src: CitationItem) => {
   previewCitation.value = src
   previewVisible.value = true
   previewTableData.value = null
-  // 【P1-3】SQL 引用 → 拉真实行数据渲染迷你表格
+  // SQL 引用 → 拉真实行数据渲染迷你表格
   if (src.ragTrack === 'sql' && src.sheetName && src.rowIndices && src.rowIndices.length > 0) {
     previewTableLoading.value = true
     try {
@@ -834,7 +834,7 @@ const submitQuery = async () => {
   const aiMessageIndex = chatHistory.value.length - 1
   await scrollToBottom()
 
-  // 【P2-1】为本次请求创建独立 AbortController，停止按钮 abort 它
+  // 为本次请求创建独立 AbortController，停止按钮 abort 它
   const ac = new AbortController()
   abortControllerRef.value = ac
 
@@ -847,7 +847,7 @@ const submitQuery = async () => {
       },
       {
         onChunk: (chunkedText) => {
-          // 【P2-2】不再每 chunk 同步写 msg.content（会触发 1 次 marked + 1 次 v-html 重排）；
+          // 不再每 chunk 同步写 msg.content（会触发 1 次 marked + 1 次 v-html 重排）；
           // 改为只更新"帧间变量"，rAF 下一帧把最新的 pendingText 一次性推到 msg.content
           streamingMsgIndex = aiMessageIndex
           streamingPendingText = chunkedText
@@ -887,7 +887,7 @@ const submitQuery = async () => {
     // 流结束后刷新会话列表（标题可能自动改写了）
     await fetchSessions()
   } catch (error: any) {
-    // 【P2-1】用户主动中止：axios 抛 CanceledError，不当作错误处理，
+    // 用户主动中止：axios 抛 CanceledError，不当作错误处理，
     // stopStreaming 已经在 abort 前把最后一条 AI 消息标了 stopped=true
     const isCanceled = error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED'
     if (isCanceled) {
@@ -896,7 +896,7 @@ const submitQuery = async () => {
       chatHistory.value[aiMessageIndex].content = `❌ 网络异常: 与局域网 RAG 服务器连接超时`
     }
   } finally {
-    // 【P2-2】finally 是流收敛的总闸：无论成功/异常/被 abort，都走 flushStreamingRender
+    // finally 是流收敛的总闸：无论成功/异常/被 abort，都走 flushStreamingRender
     // 把 rAF 队列里"最后一段文本"同步落到 msg.content，再关 rAF、清状态
     flushStreamingRender()
     streamingActive.value = false
@@ -906,7 +906,7 @@ const submitQuery = async () => {
 }
 
 /**
- * 【P2-1】主动停止当前流式问答
+ * 主动停止当前流式问答
  * 1) 给最后一条 AI 消息打 `stopped: true` 标（保留 partial content）
  * 2) 触发 AbortController → axios 立即 reject → 后端 req close → service 退出 LLM 循环
  * 3) finally 里 streamingActive 翻回 false，按钮自动切回"发送"
@@ -917,7 +917,7 @@ const stopStreaming = () => {
   if (lastMsg && lastMsg.role === 'assistant') {
     lastMsg.stopped = true
   }
-  // 【P2-2】主动停止：同步把 rAF 还没来得及推的最后一段文本落到 content，
+  // 主动停止：同步把 rAF 还没来得及推的最后一段文本落到 content，
   // 否则 v-html 上一次 marked 的结果可能停留在"rAF 上一帧"的状态，最后几个字符丢失
   flushStreamingRender()
   if (ac) {
@@ -929,7 +929,7 @@ const stopStreaming = () => {
   }
 }
 
-// 【P2-2】流收敛：流结束（finally）/ 主动停止 / 网络错误 三条路径都要走这里
+// 流收敛：流结束（finally）/ 主动停止 / 网络错误 三条路径都要走这里
 // 把 streamingPendingText 最后一次写进 msg.content、关 rAF、清状态。
 // 幂等：streamingMsgIndex === -1 时直接 return，可被多次调用。
 const flushStreamingRender = () => {
@@ -964,7 +964,7 @@ const formatSize = (bytes: number) => {
 const formatScore = (score: number) => `${(score * 100).toFixed(1)}%`
 
 /**
- * 【P1-3】把行号数组压缩成"2-5, 8, 11-13"形式
+ * 把行号数组压缩成"2-5, 8, 11-13"形式
  * 避免一次性把上百行塞 UI。超 6 个连续段时只显示首尾。
  */
 const formatRowRange = (rows: number[]): string => {
@@ -1260,7 +1260,7 @@ onMounted(async () => {
 }
 
 /* ==========================================================================
-   🌲【P1-4】知识源 el-tree 自定义样式
+   🌲知识源 el-tree 自定义样式
    ========================================================================== */
 .source-tree {
   background: transparent;
@@ -1541,7 +1541,7 @@ onMounted(async () => {
   color: #dc2626;
 }
 
-/* 【P2-1】用户主动中断后的徽标 —— flex + center 强制图标和文本中线对齐 */
+/* 用户主动中断后的徽标 —— flex + center 强制图标和文本中线对齐 */
 .stopped-badge {
   display: inline-flex;
   align-items: center;
@@ -1628,7 +1628,7 @@ onMounted(async () => {
 }
 
 /* ==========================================================================
-   🌟【P1-1】引用源卡片
+   🌟引用源卡片
    ========================================================================== */
 .citations-wrapper {
   margin-top: 14px;
@@ -1756,7 +1756,7 @@ onMounted(async () => {
   flex-shrink: 0;
 }
 
-/* 【P1-3】轨道标签 */
+/* 轨道标签 */
 .citation-track-tag {
   font-size: 10px;
   font-weight: 700;
@@ -1846,7 +1846,7 @@ onMounted(async () => {
 }
 
 /* ==========================================================================
-   🌟【P1-2】引用原文预览弹窗
+   🌟引用原文预览弹窗
    ========================================================================== */
 .preview-content {
   display: flex;
@@ -1911,7 +1911,7 @@ onMounted(async () => {
   overflow-y: auto;
 }
 
-/* 【P1-3】SQL 引用预览迷你表格 */
+/* SQL 引用预览迷你表格 */
 .preview-table-wrapper {
   background-color: var(--rag-bg-container);
   border: 1px solid var(--rag-border-sub);

@@ -11,22 +11,17 @@ import * as path from 'path'
 type Pipeline = any
 
 /**
- * 【P2-1】Cross-encoder Rerank Provider
+ * Cross-encoder Rerank Provider
  *
- * 用 @huggingface/transformers 加载 Xenova/bge-reranker-base（quantized）模型，
- * 在执行 askStream 时对 vectorSearch 召回的 topK chunks 重新打分排序。
+ * - 用 @huggingface/transformers 加载 bge-reranker（默认 Xenova/bge-reranker-base q8 ~280MB），
+ *   对 vectorSearch 召回的 topK chunks 重排后再喂给 LLM
+ * - 懒加载：构造时不下载模型，首次 rerank() 才触发，避免服务启动阻塞
+ * - 降级：模型加载/推理失败 → 抛错 → 调用方 fallback 到原 topK，RagService 用 slice(0, 4) 兜底
+ * - 启动安全：完全懒加载，RagModule 装配时绝不触发 onnxruntime-node native binding 加载
+ *   （即使 Windows DLL 失败 / 缺 VC++ Redistributable，服务也能正常启动）
+ * - 配置项：`ai.rerank.modelName` / `ai.rerank.charBudget`（字符截断，默认 1024，覆盖 BGE 512 token 上下文）
  *
- * 设计要点：
- * - 懒加载：构造时不下载模型；首次 rerank() 才触发（避免服务启动阻塞）
- * - 降级友好：ensureLoaded() 或 rerank() 抛错时，调用方应 catch 并 fallback 到原 topK
- * - 模型缓存：默认 cacheDir = <cwd>/.cache/transformers/（避免反复下载）
- * - 启动安全：RagModule 加载时绝不触发 onnxruntime-node native binding 加载
- *   - 即使 Windows 上 DLL 失败（如缺 VC++ Redistributable），服务也能正常启动
- *   - 失败后该 Provider 退化为 no-op，vectorSearch topK=20 → 直接 slice(0, 4)
- *
- * 【P0-5】Rerank 截断字符数配置化：
- *   - 旧硬编码 512 字符对中文偏短（BGE-reranker-base tokenizer 把中文 1 字符 ≈ 1.5 token，512 字符 ≈ 340 token，浪费了 512 context 的余量）
- *   - 改从 `ai.rerank.charBudget` yml 读，默认 1024；P1-2 切到 v2-m3 后再调到 1500
+ * @see 详细设计见文件顶部模块级注释（懒加载、降级、量化、Windows 诊断提示）
  */
 @Injectable()
 export class RerankProvider {
@@ -37,13 +32,16 @@ export class RerankProvider {
   private transformersDisabled = false
 
   // 模型名：可通过 ai.rerank.modelName 切换（默认 Xenova/bge-reranker-base，~280MB）
-  // 【P1-2】切到 'BAAI/bge-reranker-v2-m3' 拿到多语种 + 8K context + MTEB SOTA（q8 量化 ~568MB）
+  // 切到 'BAAI/bge-reranker-v2-m3' 拿到多语种 + 8K context + MTEB SOTA（q8 量化 ~568MB）
   private readonly modelName: string
 
-  // 【P0-5】默认 1024 字符预算（覆盖 BGE-reranker-base 512 token 的 ~80%）
+  // 默认 1024 字符预算（覆盖 BGE-reranker-base 512 token 的 ~80%）
   // v2-m3 context 8192 token ≈ 4500 字符；调到 1500 控延迟
   private readonly charBudget: number
 
+  /**
+   * @param configService NestJS ConfigService（用于读 ai.rerank.modelName / charBudget）
+   */
   constructor(configService?: ConfigService) {
     this.modelName =
       configService?.get<string>('ai.rag.p1.rerankModel') ||
@@ -124,7 +122,7 @@ export class RerankProvider {
     if (!this.pipe) {
       throw new Error('[P2-1 Rerank] model pipe is null after ensureLoaded')
     }
-    // 【P0-5】截断字符数可配置（ai.rerank.charBudget），默认 1024
+    // 截断字符数可配置（ai.rerank.charBudget），默认 1024
     const outputs: any = await this.pipe(
       question,
       candidates.map((c) => c.pageContent.slice(0, this.charBudget)),

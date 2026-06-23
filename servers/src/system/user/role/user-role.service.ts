@@ -15,6 +15,12 @@ import { UserRoleEntity } from './user-role.entity'
 
 import { CreateOrUpdateUserRolesDto } from '../dto/create-user-roles.dto'
 
+/**
+ * 用户-角色 Service
+ * - 维护 sys_user_role 表的写操作（角色绑定 / 取消）
+ * - 角色变化时同步失效相关用户缓存（role / menu / perm）
+ * - 提供「按角色查用户」「按用户查角色」两个方向的查询能力
+ */
 @Injectable()
 export class UserRoleService {
   constructor(
@@ -34,12 +40,14 @@ export class UserRoleService {
         return { roleId, userId: dto.userId }
       }),
     )
+    // 事务内：先按 userId 清空旧关系，再插入新关系，保证原子性
     const res = await this.userManager.transaction(async (transactionalEntityManager) => {
       await transactionalEntityManager.delete(UserRoleEntity, { userId: dto.userId })
       const result = await transactionalEntityManager.save<UserRoleEntity>(userRoleList)
       return result
     })
     if (!res) return ResultData.fail(AppHttpCode.SERVICE_ERROR, '用户更新角色失败')
+    // 同步回写 Redis 的 USER_ROLE 列表（供 findUserRoleByUserId 直接命中缓存）
     await this.redisService.set(getRedisKey(RedisKeyPrefix.USER_ROLE, dto.userId), JSON.stringify(dto.roleIds))
     return ResultData.ok()
   }
@@ -55,6 +63,7 @@ export class UserRoleService {
       // 绑定取消关系中，包含自身，一般自己不可操作自己的权限
       return ResultData.fail(AppHttpCode.ROLE_NO_FORBIDDEN, '当前登录用户不可改变自己的角色')
     }
+    // 事务内：create → 批量插入；cancel → 按 (roleId, userId IN ...) 删除
     const res = await this.userManager.transaction(async (transactionalEntityManager) => {
       if (createOrCancel === 'create') {
         const dto = plainToInstance(
@@ -69,7 +78,7 @@ export class UserRoleService {
       }
     })
     if (res) {
-      // 清除角色更新的用户缓存
+      // 清除角色更新的用户缓存：role 列表 + menu + perm 都要重算
       const keys = []
       userIds.forEach((userId) => {
         keys.push(
@@ -80,6 +89,7 @@ export class UserRoleService {
           ],
         )
       })
+      // unlink 批量删除（相比 del 不会阻塞 Redis 主线程）
       await this.redisService.getClient().unlink(keys)
       return ResultData.ok()
     } else
@@ -100,6 +110,7 @@ export class UserRoleService {
   async findUserByRoleId(roleId: string, page: number, size: number, isCorrelation: boolean): Promise<ResultData> {
     let res
     if (isCorrelation) {
+      // 关联分支：sys_user left join sys_user_role，匹配 role_id
       res = await this.dataSource
         .createQueryBuilder('sys_user', 'su')
         .leftJoinAndSelect('sys_user_role', 'ur', 'ur.user_id = su.id')
@@ -108,6 +119,7 @@ export class UserRoleService {
         .take(size)
         .getManyAndCount()
     } else {
+      // 非关联分支：用子查询找出拥有 roleId 的用户，再 NOT IN 排除
       res = await this.dataSource
         .createQueryBuilder('sys_user', 'su')
         .where((qb: any) => {
@@ -132,6 +144,7 @@ export class UserRoleService {
     const result = await this.redisService.get(userRoleKey)
     if (result) return JSON.parse(result)
     else {
+      // 缓存未命中：查 DB 并回写（无显式 TTL，由 USER_INFO 失效带动）
       const roles = await this.userRoleRepo.find({ select: ['roleId'], where: { userId: id } })
       const roleIds = roles.map((v) => v.roleId)
       await this.redisService.set(userRoleKey, JSON.stringify(roleIds))

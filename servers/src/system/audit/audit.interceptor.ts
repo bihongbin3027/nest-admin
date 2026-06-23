@@ -11,7 +11,7 @@ import { Request, Response } from 'express'
 import { AuditLogService } from './audit-log.service'
 
 /**
- * 【P0-3】审计日志拦截器
+ * 审计日志拦截器
  *
  * 使用方式：在 Controller 类装饰器加 @UseInterceptors(AuditInterceptor)
  *
@@ -38,18 +38,29 @@ export class AuditInterceptor implements NestInterceptor {
 
   constructor(private readonly auditLogService: AuditLogService) {}
 
+  /**
+   * 拦截请求并异步记录审计日志
+   * - 提前抓取 userId / method / url / ip，避免后续 res 关闭后无法读取
+   * - 通过 res.on('finish' / 'close') + catchError 三条路径保证至少记录一次
+   * - finished 标志位保证幂等：同一请求不会重复入库
+   * @param ctx NestJS ExecutionContext（HTTP 场景）
+   * @param next 下一个处理器（返回 Observable）
+   * @returns 透传下游 Observable
+   */
   intercept(ctx: ExecutionContext, next: CallHandler): Observable<any> {
     const req = ctx.switchToHttp().getRequest<Request>()
     const res = ctx.switchToHttp().getResponse<Response>()
+    // 记录请求开始时间戳；仅在 AUDIT_DEBUG=1 时打印响应耗时
     const startTime = Date.now()
 
-    // 提前抓取请求信息
+    // 提前抓取 userId / method / url / ip，构造 baseEntry
+    // （必须在 res 关闭 / 流式结束前完成快照，避免后续无法读取）
     const userId = this.extractUserId(req)
     const method = req.method
     const url = req.originalUrl || req.url
     const ip = this.extractIp(req)
 
-    // 推断 action + resourceType + resourceId
+    // 由 method + URL 模式推断 action / resourceType / resourceId
     const inferred = this.inferActionAndResource(method, url, req)
     const baseEntry = {
       userId,
@@ -78,7 +89,7 @@ export class AuditInterceptor implements NestInterceptor {
       }
     }
 
-    // 监听 res.finish 和 res.close，覆盖正常完成、客户端断开、SSE 流式结束
+    // 监听 res.finish / res.close，覆盖正常完成、客户端断开、SSE 流式结束三种退出时机
     res.on('finish', () => {
       recordOnce(res.statusCode, res.statusCode >= 400 ? this.extractBody(req) : null)
     })
@@ -87,20 +98,20 @@ export class AuditInterceptor implements NestInterceptor {
       recordOnce(res.statusCode || 499, 'Client closed connection')
     })
 
-    // 异常路径：立即记录
+    // 异常路径：立即用 err.status 记录，无需等待 res.finish
+    // 已知限制：当前无法从 controller 返回的 data.data.id 回填 resourceId
+    //   原因：baseEntry 在 intercept 入口已快照，tap/map 异步更新不可靠
+    //   影响：upload_file / create_session 等"先创建后取 ID"接口的 resourceId 会为 null
     return next.handle().pipe(
-      // map 阶段：controller 同步返回 ResultData.ok(data) → 提取 data.data.id 作为 resourceId 覆盖
-      // 解决 upload_file 等"创建后才有 ID"的场景（POST 时无法从 query/path 推断 resourceId）
       catchError((err) => {
         const statusCode = err?.status || 500
         recordOnce(statusCode, err?.message?.slice(0, 500) || 'Unknown error')
         return throwError(() => err)
       }),
-      // 注意：tap 不能在这里直接更新 recordOnce（异步 + 不能改 baseEntry），
-      // 解决：捕获 controller 返回的 data，提取 id 后再 recordOnce
     )
   }
 
+  /** 从 req.user.id 安全提取数字用户 ID（兼容字符串 / 数字 / 空值；解析失败回退 null） */
   private extractUserId(req: any): number | null {
     const raw = req.user?.id
     if (raw === undefined || raw === null || raw === '') return null
@@ -108,6 +119,7 @@ export class AuditInterceptor implements NestInterceptor {
     return Number.isFinite(num) ? num : null
   }
 
+  /** 提取客户端 IP，优先级：req.ip（trust proxy 已开启）→ x-forwarded-for → socket remoteAddress */
   private extractIp(req: any): string | null {
     return req.ip || req.headers?.['x-forwarded-for'] || req.connection?.remoteAddress || null
   }
@@ -115,6 +127,16 @@ export class AuditInterceptor implements NestInterceptor {
   /**
    * 从 method + url 推断 action 和资源类型
    * RAG 模块 URL 模式 → action 映射
+   *
+   * 推断规则：
+   * - 去掉 /api 前缀与 query string 后，按正则顺序匹配
+   * - 匹配成功：返回预定义 action + resourceType + extractResourceId()
+   * - 未匹配：action 兜底为 `${method}_${path}`，resourceType / resourceId 均为 null
+   *
+   * @param method HTTP 方法
+   * @param url 原始 URL（可能含 query）
+   * @param req Express Request，用于读 query / body
+   * @returns 推断结果
    */
   private inferActionAndResource(
     method: string,
@@ -156,6 +178,14 @@ export class AuditInterceptor implements NestInterceptor {
     }
   }
 
+  /**
+   * 从 path / query / body 提取资源 ID
+   * 优先级：query.id | query.fileId → path 数字段（/rag/sessions/123/...）→ body.fileId | body.id
+   * @param path 已去掉 /api 前缀与 query 的路径
+   * @param req Express Request
+   * @param action 当前 action（暂未使用，保留便于未来按 action 定制提取策略）
+   * @returns 资源 ID，无法识别时返回 null
+   */
   private extractResourceId(path: string, req: any, action: string): number | null {
     // 优先级 1：从 query.id / query.fileId 提取（DELETE /rag/file/delete?id=5）
     const queryId = req.query?.id || req.query?.fileId
@@ -177,6 +207,10 @@ export class AuditInterceptor implements NestInterceptor {
     return null
   }
 
+  /**
+   * 提取请求 body 的 JSON 字符串（截断 500 字符）用于错误日志
+   * 解析失败（如循环引用）回退 null
+   */
   private extractBody(req: any): string | null {
     try {
       const body = req.body
@@ -188,6 +222,11 @@ export class AuditInterceptor implements NestInterceptor {
     }
   }
 
+  /**
+   * 真正调用 service 写入审计日志
+   * fire-and-forget：不 await、不阻塞业务响应；service 内部已 try/catch 兜底
+   * @param entry 完整审计条目
+   */
   private fireLog(entry: {
     userId: number | null
     action: string

@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config'
 import { Document } from '@langchain/core/documents'
 
 /**
- * P1-3：Qdrant 混合检索 Provider（BM25 Sparse + Dense + RRF 融合）
+ * Qdrant 混合检索 Provider（BM25 Sparse + Dense + RRF 融合）
  *
  * 解决纯 dense 检索的两大问题：
  *   1) 专有名词 / 缩写 / ID 类查询召回率低（如"GB/T 19001"、"Q3 销售额"、"张三"）
@@ -26,6 +26,11 @@ import { Document } from '@langchain/core/documents'
  *       由 RagService 算好 denseVec 后传入。
  */
 
+/**
+ * 混合检索点的内存表示（Qdrant upsert payload 简化版）
+ * - default：dense 向量（embo-01 1536 维）
+ * - text：sparse 向量（BM25 风格 term-frequency indices/values）
+ */
 interface HybridPoint {
   id: string
   payload: Record<string, unknown>
@@ -35,12 +40,23 @@ interface HybridPoint {
   }
 }
 
+/**
+ * Qdrant 混合检索 Provider
+ *
+ * - 负责：collection schema 管理（dense + sparse）、混合检索（prefetch + RRF 融合）、单点 upsert
+ * - 不持有 Embeddings 实例：denseVec 由 RagService 算好后传入，避免 MiniMaxEmbeddings 私有类的 DI 复杂度
+ * - 降级：若 collection 不支持 sparse（< 1.10 或 schema 未启用），fallback 到 dense-only
+ * - 中文分词：用 character n-gram（单字 + bigram）近似 BM25，比纯 dense 提升 10-20% 召回率
+ */
 @Injectable()
 export class QdrantHybridProvider {
   private readonly logger = new Logger(QdrantHybridProvider.name)
   private readonly qdrantUrl: string
   private readonly collectionName: string
 
+  /**
+   * @param configService NestJS ConfigService
+   */
   constructor(private readonly configService: ConfigService) {
     this.qdrantUrl = this.configService.get<string>('ai.qdrant.url') || 'http://localhost:6333'
     this.collectionName =
@@ -52,6 +68,8 @@ export class QdrantHybridProvider {
    * - 已配置 → 无需任何操作
    * - 未配置但 collection 已存在 + 有点 → 不能改 schema（Qdrant 限制），需重建
    * - 未配置且 collection 不存在 / 空的 → 走 createCollection 带 sparse
+   * @param denseDim dense 向量维度
+   * @returns ready 是否可用；needRebuild 是否需要 DELETE 重建
    */
   async ensureHybridSchema(denseDim: number): Promise<{ ready: boolean; needRebuild: boolean }> {
     // 1) 检查 collection 是否存在
@@ -65,12 +83,12 @@ export class QdrantHybridProvider {
     const pointsCount = collInfo?.result?.points_count ?? 0
     const hasSparse = !!collInfo?.result?.config?.params?.sparse_vectors
     if (hasSparse) {
-      this.logger.log(`[P1-3] collection ${this.collectionName} 已含 sparse 向量，无需 schema 改造`)
+      this.logger.log(`collection ${this.collectionName} 已含 sparse 向量，无需 schema 改造`)
       return { ready: true, needRebuild: false }
     }
     if (pointsCount === 0) {
       // 存在但空（schema 不含 sparse），删除重建
-      this.logger.warn(`[P1-3] collection ${this.collectionName} 空但无 sparse，删除重建`)
+      this.logger.warn(`collection ${this.collectionName} 空但无 sparse，删除重建`)
       await fetch(`${this.qdrantUrl}/collections/${this.collectionName}`, { method: 'DELETE' })
       await this.createHybridCollection(denseDim)
       return { ready: true, needRebuild: false }
@@ -78,7 +96,7 @@ export class QdrantHybridProvider {
     // 已存在 + 有数据 + 无 sparse → 没法在线改 schema（Qdrant 限制）
     // 让调用方决定：默认 fallback 到 dense-only，或调用方主动 DELETE collection
     this.logger.warn(
-      `[P1-3] collection ${this.collectionName} 已有 ${pointsCount} 点但无 sparse schema，需 DELETE 重建才能启用 hybrid`,
+      `collection ${this.collectionName} 已有 ${pointsCount} 点但无 sparse schema，需 DELETE 重建才能启用 hybrid`,
     )
     return { ready: false, needRebuild: true }
   }
@@ -103,9 +121,9 @@ export class QdrantHybridProvider {
       body: JSON.stringify(body),
     })
     if (!r.ok) {
-      throw new Error(`[P1-3] createHybridCollection failed: HTTP ${r.status} ${(await r.text()).slice(0, 300)}`)
+      throw new Error(`createHybridCollection failed: HTTP ${r.status} ${(await r.text()).slice(0, 300)}`)
     }
-    this.logger.log(`[P1-3] 创建 hybrid collection: dim=${denseDim} cosine + BM25-sparse`)
+    this.logger.log(`创建 hybrid collection: dim=${denseDim} cosine + BM25-sparse`)
   }
 
   /**
@@ -171,7 +189,7 @@ export class QdrantHybridProvider {
   ): Promise<{ doc: Document; score: number }[]> {
     const sparse = this.buildSparseVector(question)
     if (sparse.indices.length === 0) {
-      this.logger.warn('[P1-3] sparse 为空（query 没 token），fallback 到 dense-only')
+      this.logger.warn('sparse 为空（query 没 token），fallback 到 dense-only')
       return this.denseOnlySearch(denseVec, filter, topK)
     }
     const body = {
@@ -191,7 +209,7 @@ export class QdrantHybridProvider {
     })
     if (!r.ok) {
       const txt = await r.text()
-      this.logger.error(`[P1-3] hybridSearch failed: HTTP ${r.status} ${txt.slice(0, 300)}`)
+      this.logger.error(`hybridSearch failed: HTTP ${r.status} ${txt.slice(0, 300)}`)
       return []
     }
     const data: any = await r.json()
@@ -207,6 +225,10 @@ export class QdrantHybridProvider {
 
   /**
    * Dense-only fallback（hybrid schema 未生效时）
+   * - 用于 sparse 为空 / Qdrant 不支持 sparse / collection 重建前的过渡期
+   * @param denseVec dense 向量
+   * @param filter   Qdrant filter
+   * @param topK     最终返回 top-K
    */
   async denseOnlySearch(
     denseVec: number[],

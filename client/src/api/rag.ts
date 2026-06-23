@@ -20,7 +20,7 @@ export interface RagAssetItem {
   updatedAt: string
 }
 
-// 【P1-1 / P1-3】引用源条目
+// 引用源条目
 // - ragTrack='vector'（长文本）：chunkIndex 是文本切片号
 // - ragTrack='sql'（结构化表格）：sheetName/rowIndices/columns 标记行级来源
 export interface CitationItem {
@@ -35,7 +35,7 @@ export interface CitationItem {
   columns?: string[] | null
 }
 
-// 【P1-2】会话 & 消息
+// 会话 & 消息
 export interface RagSessionItem {
   id: number
   userId: number
@@ -53,7 +53,7 @@ export interface RagMessageItem {
   createdAt: string
 }
 
-// 【P1-3】SQL 轨道引用的真实行数据
+// SQL 轨道引用的真实行数据
 export interface StructuredRowsResponse {
   sheetName: string
   columns: string[]
@@ -103,7 +103,7 @@ export function deleteKnowledgeFile(id: number) {
   })
 }
 
-// 【P1-3】拉取 SQL 引用对应的真实行数据
+// 拉取 SQL 引用对应的真实行数据
 export function fetchStructuredRows(data: { fileId: number; sheetName: string; rowIndices: number[] }) {
   return request<RAGResponse<StructuredRowsResponse>>({
     url: '/rag/file/structured-rows',
@@ -113,7 +113,7 @@ export function fetchStructuredRows(data: { fileId: number; sheetName: string; r
 }
 
 // ============================================================================
-// 💬【P1-2】会话 CRUD
+// 💬会话 CRUD
 // ============================================================================
 
 export function listRagSessions() {
@@ -154,7 +154,7 @@ export function deleteRagSession(id: number) {
 }
 
 // ============================================================================
-// 🔥【P1-2】流式问答（SSE）—— 后端会自动管理 sessionId
+// 🔥流式问答（SSE）—— 后端会自动管理 sessionId
 // ============================================================================
 
 export interface StreamCallbacks {
@@ -171,7 +171,7 @@ export interface StreamCallbacks {
 export function askQuestionStreamApi(
   data: { question: string; sessionId?: number | null; sources?: number[] },
   callbacks: StreamCallbacks,
-  // 【P2-1】外部 AbortSignal：调用方传 controller.signal，停止按钮触发 controller.abort()
+  // 外部 AbortSignal：调用方传 controller.signal，停止按钮触发 controller.abort()
   // axios 检测到 signal abort 会抛 CanceledError，原 promise 直接 reject
   options?: { signal?: AbortSignal }
 ) {

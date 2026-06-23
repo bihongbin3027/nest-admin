@@ -11,9 +11,12 @@ import { ApiProperty } from '@nestjs/swagger'
 import { RagSessionEntity } from './rag-session.entity'
 
 /**
- * 【P1-2】RAG 会话消息流水表
- * role: 'user' | 'assistant'
- * citations: 引用源 JSON 数组，仅 assistant 消息有
+ * RAG 会话消息流水表（sys_rag_message）
+ *
+ * - role: 'user' | 'assistant'，仅 assistant 消息会带 citations（引用源 JSON 数组）
+ * - 复合索引 (sessionId, createdAt)：按会话顺序回放消息
+ * - 与 RagSessionEntity 是多对一（onDelete: 'CASCADE'：会话删 → 消息级联删）
+ * - content 用 longtext：assistant 回复可能包含完整 Markdown（含代码块、表格）
  */
 @Entity({ name: 'sys_rag_message' })
 @Index('IDX_RAG_MSG_SESSION', ['sessionId', 'createdAt'])

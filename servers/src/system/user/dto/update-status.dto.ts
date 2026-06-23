@@ -4,12 +4,18 @@ import { $enum } from 'ts-enum-util'
 
 import { StatusValue } from '../../../common/enums/common.enum'
 
+/**
+ * 启用/禁用用户 DTO
+ * - UserController.updateStatus / UserService.updateStatus 使用
+ */
 export class UpdateStatusDto {
+  /** 目标用户 id */
   @ApiProperty({ description: '用户编码' })
   @IsString({ message: 'id 类型错误，正确类型 string' })
   @IsNotEmpty({ message: 'id 不能为空' })
   readonly id: string
 
+  /** 目标状态：1-有效，0-禁用 */
   @ApiProperty({ description: '所属状态: 1-有效，0-禁用', enum: $enum(StatusValue).getValues() })
   @IsNumber({}, { message: 'status 类型错误，正确类型 number' })
   @IsNotEmpty({ message: 'status 不能为空' })

@@ -3,15 +3,16 @@ type Limit = (fn: () => Promise<any>) => Promise<any>
 import CircuitBreaker from 'opossum'
 
 /**
- * 【P1-3】限流 + 熔断工具
+ * 限流 + 熔断工具
  *
- * - LimitFn：p-limit 包装，控制并发数（避免瞬时打爆第三方 API rate limit）
- * - wrapWithBreaker：opossum 包装，错误率超阈值时打开熔断器，短路快速失败
+ * - createLimit：p-limit 包装，控制并发数（避免瞬时打爆第三方 API rate limit）
+ * - wrapWithBreaker：opossum 包装，按错误率阈值（默认 50%）触发熔断，短路快速失败
+ * - limitAndBreaker：先限流后熔断，LLM / embedding 这类外部依赖调用的标准组合
  *
  * 设计要点：
- * - 熔断器打开时**快速失败**（不调用底层），避免故障扩散
- * - 超时半开探测（30s 后尝试一次），成功则关闭熔断器
- * - 熔断状态通过回调上报到 Prometheus（rag_circuit_breaker_state）
+ * - 熔断器打开时**快速失败**（不调用底层 fn），避免故障扩散
+ * - resetTimeout 后熔断器半开探测（尝试一次），成功则关闭熔断器
+ * - 熔断状态通过 onStateChange 回调上报到 Prometheus（rag_circuit_breaker_state）
  */
 
 export interface LimitOpts {

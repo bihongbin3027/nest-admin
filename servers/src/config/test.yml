@@ -51,7 +51,7 @@ perm:
         { path: "/api/login", method: "POST" },
         { path: "/api/perm/:id", method: "GET" },
         { path: "/api/oss/upload", method: "POST" },
-        # 【P1-1】监控端点免登录：Prometheus 抓取 / k8s 探针
+        # 监控端点免登录：Prometheus 抓取 / k8s 探针
         { path: "/api/metrics", method: "GET" },
         { path: "/api/health", method: "GET" },
         { path: "/api/health/live", method: "GET" },
@@ -70,12 +70,12 @@ ai:
     baseURL: "https://api.minimaxi.com/v1" # OneAPI 的地址
     chatModel: "MiniMax-Text-01"
     embeddingModel: "embo-01"                # 或者是 qwen-max, deepseek-chat 等流式响应模型
-    temperature: 0                         # 【P0-5】RAG 严谨场景必须 0
+    temperature: 0                         # RAG 严谨场景必须 0
   qdrant:
     url: "http://localhost:6333"           # Qdrant 向量数据库的物理连接地址
     collectionName: "rag_demo_collection"  # 统一管理的非结构化向量空间名称
   rerank:
-    charBudget: 1024                       # 【P0-5】rerank 输入截断字符预算
+    charBudget: 1024                       # rerank 输入截断字符预算
   rag:
     p0:
       smartHeader: true

@@ -15,6 +15,12 @@ import { UserType } from '../../common/enums/common.enum'
 import { MenuEntity } from '../menu/menu.entity'
 import { RouteDto } from './dto/route.dto'
 
+/**
+ * 权限聚合 Service
+ * - 聚合 user → role → menu → menu_perm 的多表关联，提供"用户接口权限"与"用户菜单树"两类查询
+ * - 内置 Redis 缓存（TTL 与 jwt.expiresin 对齐），写操作由 role/menu 模块通过 clearUserInfoCache 主动失效
+ * - 提供 findAppAllRoutes 反查 Swagger 文档，给角色管理页"权限下拉"使用
+ */
 @Injectable()
 export class PermService {
   constructor(
@@ -26,39 +32,41 @@ export class PermService {
     this.REDIS_PREFIX = config.get<string>('redis.keyPrefix') || ''
   }
 
+  /** Redis key 前缀（来自配置 redis.keyPrefix），用于还原 SCAN 原始 key */
   private REDIS_PREFIX = ''
 
-  // redis scan 遍历数，根据用户量调整设置，
+  /** 单次 SCAN 的 COUNT 上限，按用户量调整；过小会增加 RTT，过大可能阻塞 Redis */
   private TRAVERSE_MAX_VALUE = 1000
 
   /**
    * 查询个人 拥有的 api 权限
    * 超管用户不用在这里处理，在 role.guard 守卫中判断是超管 直接 return true
    * 查询生成语句
-    SELECT
-      `mp`.`api_url`,
-      `mp`.`api_method`
-    FROM
-      `sys_user_role` `ur`
-      LEFT JOIN `sys_role_menu` `rm` ON `ur`.`role_id` = `rm`.`role_id`
-      LEFT JOIN `sys_menu_perm` `mp` ON `rm`.`menu_id` = `mp`.`menu_id`
-    WHERE
-      `ur`.`user_id` = ?
-      AND `mp`.`menu_id` != 1
-    GROUP BY
-      `mp`.`api_url`,
-      `mp`.`api_method`
-      -- 去除 null, 关于 mysql null 是 没有值，当 != 的时候 null 属于没有值而被过滤掉
-      =- group by 去重，多个角色绑定一个接口查询重复，所以使用 group by 去掉重复的接口
-   * @param userId
-   * @returns
+     SELECT
+       `mp`.`api_url`,
+       `mp`.`api_method`
+     FROM
+       `sys_user_role` `ur`
+       LEFT JOIN `sys_role_menu` `rm` ON `ur`.`role_id` = `rm`.`role_id`
+       LEFT JOIN `sys_menu_perm` `mp` ON `rm`.`menu_id` = `mp`.`menu_id`
+     WHERE
+       `ur`.`user_id` = ?
+       AND `mp`.`menu_id` != 1
+     GROUP BY
+       `mp`.`api_url`,
+       `mp`.`api_method`
+       -- 去除 null, 关于 mysql null 是 没有值，当 != 的时候 null 属于没有值而被过滤掉
+       =- group by 去重，多个角色绑定一个接口查询重复，所以使用 group by 去掉重复的接口
+   * @param userId 用户 id
+   * @returns RouteDto[] 该用户可访问的接口列表（path + method）
    */
   async findUserPerms(userId: string): Promise<RouteDto[]> {
     // mp.menu_id != 1 去掉 有些角色可能没有菜单， 查询的时候 为 null, 不能直接 ！null
+    // 先查 Redis 缓存，避免每次请求都走多表 join
     const redisKey = getRedisKey(RedisKeyPrefix.USER_PERM, userId)
     const result = await this.redisService.get(redisKey)
     if (result) return JSON.parse(result)
-    // const
+    // 缓存未命中，执行多表 join 查询
     const permsResult = await this.dataSource
       .createQueryBuilder()
       .select(['mp.api_url', 'mp.api_method'])
@@ -69,7 +77,9 @@ export class PermService {
       .groupBy('mp.api_url')
       .addGroupBy('mp.api_method')
       .getRawMany()
+    // 转换为 RouteDto 形态：path/method 大写
     const perms = permsResult.map((v) => ({ path: v.api_url, method: v.api_method }))
+    // 回填缓存，TTL 与 access token 有效期一致，避免 token 失效后还能命中旧权限
     await this.redisService.set(redisKey, JSON.stringify(perms), ms(this.config.get<string>('jwt.expiresin')) / 1000)
     return perms
   }
@@ -97,23 +107,26 @@ export class PermService {
       ORDER BY
         `m`.`order_num` DESC,
         `m_id` ASC
-   *
-   * ⚠️ 重要：必须 INNER JOIN（不能 LEFT JOIN）。
-   *    旧版用 LEFT JOIN + GROUP BY m.id 在 MySQL 下等价于 sys_menu 全表扫描，
-   *    任何已绑定角色（哪怕角色菜单为空）的非超管用户都能看到全部菜单 —— 越权。
-   *    改成 INNER JOIN 后，只有真正授权给当前用户角色的菜单才会出现。
-   * @param userId
-   * @param userType
-   * @returns
+     *
+     * ⚠️ 重要：必须 INNER JOIN（不能 LEFT JOIN）。
+     *    旧版用 LEFT JOIN + GROUP BY m.id 在 MySQL 下等价于 sys_menu 全表扫描，
+     *    任何已绑定角色（哪怕角色菜单为空）的非超管用户都能看到全部菜单 —— 越权。
+     *    改成 INNER JOIN 后，只有真正授权给当前用户角色的菜单才会出现。
+   * @param userId 用户 id
+   * @param userType 用户类型，超管直接返回全部菜单
+   * @returns MenuEntity[] 该用户可见的菜单列表（不含按钮 type=3）
    */
   async findUserMenus(userId: string, userType: UserType): Promise<MenuEntity[]> {
+    // 优先走 Redis 缓存
     const redisKey = getRedisKey(RedisKeyPrefix.USER_MENU, userId)
     const result = await this.redisService.get(redisKey)
     if (result) return JSON.parse(result)
     let menusResult
     if (userType === UserType.SUPER_ADMIN) {
+      // 超管直接返回 sys_menu 全表（绕过 join），走全量数据通道
       menusResult = await this.dataSource.createQueryBuilder().select().from('sys_menu', 'm').getRawMany()
     } else {
+      // 普通用户走 user→role→menu 关联，INNER JOIN 防止越权
       menusResult = await this.dataSource
         .createQueryBuilder()
         .select(['m.id', 'm.parent_id', 'm.name', 'm.type', 'm.code', 'm.order_num'])
@@ -127,7 +140,9 @@ export class PermService {
         .addOrderBy('m.id', 'ASC')
         .getRawMany()
     }
+    // rawMany 返回的是别名键（m_id / m_name ...），非超管分支需要把前缀 'm_' 还原成驼峰字段名
     const menus = menusResult.map((v) => objAttrToCamelOrUnderline(v, 'camelCase', UserType.SUPER_ADMIN ? '' : 'm_'))
+    // 回填缓存，TTL 与 access token 保持一致
     await this.redisService.set(redisKey, JSON.stringify(menus), ms(this.config.get<string>('jwt.expiresin')) / 1000)
     return menus
   }
@@ -148,10 +163,12 @@ export class PermService {
     // 改成下面这种 glob 安全的写法
     const finalMatch = match && match.length > 0 ? match : 'nest:user:*'
     let _cursor = ''
+    // SCAN 是游标迭代协议，游标回到 '0' 表示一轮结束；必须用循环而非 KEYS，避免阻塞 Redis
     while (_cursor !== '0') {
       const [cursor, elements] = await this.redisService
         .getClient()
         .scan(_cursor || '0', 'MATCH', finalMatch, 'COUNT', this.TRAVERSE_MAX_VALUE)
+      // 如果配置了全局 keyPrefix，SCAN 返回的 key 会带前缀；调用 unlink 时需去掉前缀
       const _elements = !this.REDIS_PREFIX ? elements : elements.map((ele) => ele.replace(this.REDIS_PREFIX, ''))
       keys.push(..._elements)
       _cursor = cursor
@@ -163,21 +180,28 @@ export class PermService {
    * 当有权限更新时， 调用该方法，清除所有用户缓存
    * 如： 角色删除，角色编辑等，菜单删除，菜单编辑等
    *
+   * @param match Redis SCAN MATCH 模式，默认 'nest:user:*'（清全部用户维度缓存）
    */
   async clearUserInfoCache(match?: string) {
     try {
       // redis scan 查询出所有 user key
       const keys = await this.traversePermKeys(match)
       // redis scan 可能返回 重复的 key,  不太清楚 ioredis scan 是否去重，在这里 加上去重 保险
+      // 用 unlink 而非 del：异步回收内存，不阻塞 Redis 主线程
       await this.redisService.getClient().unlink([...new Set(keys)])
     } catch (error) {
+      // 清缓存失败不影响主业务，最多造成短时间缓存不一致，下次写入会自然覆盖
       return
     }
   }
 
-  // 从 express router 堆栈中拿到所有路由，供前端选择，设置相应的权限
-  // 但是从堆栈拿出来的数据路由是没有描述
+  /**
+   * 从 express router 堆栈中拿到所有路由，供前端选择，设置相应的权限
+   * 但是从堆栈拿出来的数据路由是没有描述
+   * @param req 当前请求对象，用于访问 req.app._router
+   */
   async findAppAllRoutesByStack(req: Request): Promise<ResultData> {
+    // express router 内部维护 stack 数组；每个 layer.route 包含 path 与 stack[0].method
     const router = req.app._router as Router
     const routes = router.stack
       .map((layer) => {
@@ -192,8 +216,12 @@ export class PermService {
     return ResultData.ok(routes)
   }
 
+  /**
+   * 从 Swagger /api/docs-json 反查全量 API 路由（含 summary 描述）
+   * 与 findAppAllRoutesByStack 相比，能拿到中文描述，前端角色分配下拉更友好
+   */
   async findAppAllRoutesBySwaggerApi(): Promise<RouteDto[]> {
-    // 暂时这样
+    // 暂时这样：直接请求本地端口的 docs-json，需保证 app 已启动并暴露 Swagger
     const { data } = await lastValueFrom(this.http.get(`http://localhost:${this.config.get('app.port')}/api/docs-json`))
     const routes = []
     if (data?.paths) {
@@ -202,6 +230,7 @@ export class PermService {
       Object.keys(paths).forEach((path) => {
         Object.keys(paths[path]).forEach((method) => {
           const route = {
+            // swagger 路径用 {param}，与 RolesGuard 的 path-to-regexp 期望 :param 形态不一致，需做转换
             path: path.replace(/\{/g, ':').replace(/\}/g, ''),
             method: method.toUpperCase(),
             desc: paths[path][method].summary,
@@ -213,6 +242,10 @@ export class PermService {
     return routes
   }
 
+  /**
+   * 获取应用全部 API 路由（Controller 对外暴露的入口）
+   * 当前实现走 Swagger 反查，能拿到中文 summary 描述
+   */
   async findAppAllRoutes() {
     const routes = await this.findAppAllRoutesBySwaggerApi()
     return ResultData.ok(routes)
